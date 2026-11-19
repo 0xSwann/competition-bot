@@ -284,6 +284,7 @@ def run_normal(cfg, conn, todo, keys=None) -> None:
     prompt = "\n  [e] entered   [s] skip for good   [l] later   [o] open it again   [q] quit\n  > "
     threading.Thread(target=_read_keys, args=(session, keys), daemon=True).start()
     hinted = False
+    from_terminal_at = 0.0
 
     while session.comp is not None:
         comp = session.comp
@@ -292,6 +293,14 @@ def run_normal(cfg, conn, todo, keys=None) -> None:
         started = time.monotonic()
         if not session.extension_active():
             open_url(cfg, helper.BASE + "/go")  # the extension takes over this tab and moves it along from here
+        elif from_terminal_at:
+            # You pressed a key here; the comp tab follows along within a few seconds. If it doesn't
+            # (e.g. it was closed, or shows a page the extension can't reach), open the next comp in a new tab.
+            deadline = time.time() + 6
+            while time.time() < deadline and session.extension_seen <= from_terminal_at:
+                time.sleep(0.25)
+            if session.extension_seen <= from_terminal_at:
+                open_url(cfg, helper.BASE + "/go")
         print(prompt, end="", flush=True)
         while True:
             try:
@@ -311,6 +320,7 @@ def run_normal(cfg, conn, todo, keys=None) -> None:
             if source == "terminal":
                 print(prompt, end="", flush=True)
         _record(conn, comp, choice, host=" ".join(hosts), started=started)
+        from_terminal_at = time.time() if source == "terminal" else 0.0
         if source == "extension":
             print({"e": "entered", "s": "skipped", "l": "later", "q": "quit"}[choice] + " (from Chrome)")
         elif choice in ("e", "s") and cfg.close_tabs and not session.extension_active():

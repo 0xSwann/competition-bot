@@ -27,6 +27,14 @@ async function claim(tabId) {
   return cur;
 }
 
+// A comp page that won't load (site down, bad link) can't show the bar, so show our own page with the buttons.
+chrome.webNavigation.onErrorOccurred.addListener(async (d) => {
+  if (d.frameId !== 0 || d.error === 'net::ERR_ABORTED' || d.url.startsWith(BASE)) return;
+  if (d.tabId !== (await session()).tabId) return;
+  const url = chrome.runtime.getURL('error.html') + '?e=' + encodeURIComponent(d.error) + '&u=' + encodeURIComponent(d.url);
+  await chrome.tabs.update(d.tabId, { url });
+});
+
 chrome.tabs.onRemoved.addListener(async (id) => {
   if (id === (await session()).tabId) await chrome.storage.session.remove(['tabId', 'shownId']);
 });
@@ -127,6 +135,10 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     }
     if (msg.type === 'act') {
       try { return reply(await act(msg.choice)); } catch (e) { return reply({ error: String(e) }); }
+    }
+    if (msg.type === 'retry') {
+      if (tabId) await chrome.tabs.update(tabId, { url: BASE + '/go' });
+      return reply({});
     }
     if (msg.type === 'fill') {
       await fill(sender.tab.id);

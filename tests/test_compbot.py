@@ -738,9 +738,11 @@ def test_extension_end_to_end(tmp_path, monkeypatch):
 
     conn_path = tmp_path / "e.db"
     conn = db.connect(conn_path)
-    for node, title in (("1", "Win a $900 Bike from Acme"), ("2", "Win a Hat")):
+    for node, title in (("1", "Win a $900 Bike from Acme"), ("2", "Win a Hat"), ("3", "Win a Cap")):
+        # Comp 3's site is down: nothing listens on port 9.
+        url = f"{base}/goto/{node}/" if node != "3" else "http://127.0.0.2:9/goto/3/"
         conn.execute("INSERT INTO comps (node_id, title, node_url, go_url, first_seen, closing) VALUES (?, ?, 'u', ?, 'x', '2099-01-01')",
-                     (node, title, f"{base}/goto/{node}/"))
+                     (node, title, url))
     conn.commit()
     conn.close()
 
@@ -771,16 +773,19 @@ def test_extension_end_to_end(tmp_path, monkeypatch):
             worker.start()
             page = ctx.new_page()
             page.goto(opened.get(timeout=10))
-            bar = page.locator("text=Comp 1 of 2")
+            bar = page.locator("text=Comp 1 of 3")
             bar.wait_for(timeout=10000)
             assert page.locator("text=about $900").count() == 1
             page.get_by_role("button", name="Fill my details").click()
             page.wait_for_function("document.querySelector('[name=email]').value === 'lou@example.com'", timeout=5000)
             assert page.eval_on_selector("[name=first_name]", "e => e.value") == "Lou"
             page.get_by_role("button", name="Entered").click()
-            page.locator("text=Comp 2 of 2").wait_for(timeout=10000)
+            page.locator("text=Comp 2 of 3").wait_for(timeout=10000)
             assert page.url.endswith("/goto/2/")
             os.write(w_fd, b"s\n")  # pressed in the terminal instead: the tab catches up by itself
+            page.locator("text=This comp's page didn't load").wait_for(timeout=15000)  # comp 3's site is down
+            page.locator("text=Comp 3 of 3: Win a Cap").wait_for(timeout=10000)
+            page.get_by_role("button", name="Skip it").click()
             page.locator("text=All done").wait_for(timeout=10000)
             assert "1 entered" in page.inner_text("#summary")
             worker.join(10)
@@ -790,5 +795,5 @@ def test_extension_end_to_end(tmp_path, monkeypatch):
             web.shutdown()
     conn = db.connect(conn_path)
     rows = dict(conn.execute("SELECT node_id, status FROM comps").fetchall())
-    assert rows == {"1": "entered", "2": "skipped"}
+    assert rows == {"1": "entered", "2": "skipped", "3": "skipped"}
     assert conn.execute("SELECT entry_domain FROM comps WHERE node_id = '1'").fetchone()[0] == "127.0.0.2"
