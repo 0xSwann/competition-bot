@@ -1,25 +1,13 @@
 /**
- * Competition bot, phone edition. Runs free on Google Apps Script in the Gmail
- * account that owns it: watches OzBargain comps, spots win emails, alerts Discord.
+ * Competition bot Gmail watcher. Runs free on Google Apps Script in the Gmail account you use for comps.
  *
- * Setup: paste your Discord webhook below, then run setup() once.
+ * Every 10 minutes it looks for emails that might be competition wins and keeps them for the PC version,
+ * which collects them through this script's web app link and posts them to Discord. (Discord blocks
+ * messages sent from Google's servers, so the PC does the posting.)
+ *
+ * Setup: run setup() once, deploy as a web app (Execute as: Me, Who has access: Anyone), then run showLink().
+ * After pasting in a new version of this file: Deploy > Manage deployments > edit (pencil) > Version: New version.
  */
-
-// ===== Your settings =====
-const DISCORD_WEBHOOK = 'PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE';
-
-// true when the PC version is running: the PC posts the comps, and this script hands win emails to the PC,
-// which posts them to Discord (Discord blocks messages sent from Google's servers).
-const PC_MODE = false;
-
-// Comps with any of these OzBargain tags are never sent to you.
-const EXCLUDE_CATEGORIES = ['Purchase Required', 'Recruit/Referral', 'Gleam'];
-// Comps whose title or description contains any of these are never sent to you.
-const EXCLUDE_KEYWORDS = ['new zealand only', 'nz only', 'nz residents only', 'usa only', 'us residents only', 'uk only', 'gleam.io', 'gle.am/'];
-// ==========================
-
-const FEED_URL = 'https://www.ozbargain.com.au/competition/feed';
-const USER_AGENT = 'compbot/1.0 (personal use; polls the competitions RSS feed every 15 minutes)';
 
 const WIN_KEYWORDS = ['congratulations', 'congrats', "you've won", 'you have won', 'you won', 'winner',
   'lucky winner', 'prize', 'claim your', "you're a winner", 'selected as', 'drawn as'];
@@ -29,25 +17,23 @@ const STRONG_PHRASES = ["you've won", 'you have won', 'you won', "you're a winne
 const PROMO_PHRASES = ['chance to win', 'enter to win', 'could win', 'win a ', 'win an ', 'thanks for entering',
   'thank you for entering', "you're in", 'you’re in', 'entry confirmed', 'you have been entered',
   "you've been entered", 'entry received'];
-const SECOND_LEVEL = ['com', 'net', 'org', 'edu', 'gov', 'co', 'asn', 'id'];
+
+// Emails scoring this much go to the PC. The PC adds points for brands you entered with and makes the final call
+// (3 or more is a possible win), so borderline emails from those brands aren't lost.
+const SEND_TO_PC_SCORE = 1;
+// Most possible wins kept waiting for the PC (e.g. while it's off). Each one is its own Script Property.
+const MAX_WAITING = 150;
 
 // ---------- Setup ----------
 
-/** Run once. Creates the timers. */
+/** Run once. Creates the 10-minute timer. */
 function setup() {
-  if (!PC_MODE && DISCORD_WEBHOOK.indexOf('https://') !== 0) throw new Error('Paste your Discord webhook URL at the top first.');
   const props = PropertiesService.getScriptProperties();
   if (!props.getProperty('key')) props.setProperty('key', Utilities.getUuid());
   ScriptApp.getProjectTriggers().forEach(function (t) { ScriptApp.deleteTrigger(t); });
-  if (!PC_MODE) ScriptApp.newTrigger('checkFeed').timeBased().everyMinutes(15).create();
   ScriptApp.newTrigger('checkInbox').timeBased().everyMinutes(10).create();
-  if (PC_MODE) {
-    Logger.log('Set up. Next: Deploy > New deployment > Web app (Execute as: Me, Who has access: Anyone), then run showLink.');
-  } else {
-    postDiscord_('\u2705 Competition bot is set up. You\u2019ll get new comps and possible wins here.');
-    checkFeed();
-  }
   checkInbox();
+  Logger.log('Set up. Next: Deploy > New deployment > Web app (Execute as: Me, Who has access: Anyone), then run showLink.');
 }
 
 /** Run after deploying as a web app. Prints the line to paste into the PC version's config.toml. */
@@ -59,144 +45,59 @@ function showLink() {
     'config.toml under [gmail], with that URL in place of WEB_APP_URL:\n\nrelay_url = "WEB_APP_URL?key=' + key + '"');
 }
 
-/** The PC version calls this to collect possible wins found since its last call. */
-function doGet(e) {
-  const key = PropertiesService.getScriptProperties().getProperty('key');
-  const out = function (obj) { return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON); };
-  if (!e || !e.parameter || !key || e.parameter.key !== key) return out({ error: 'wrong key' });
-  const lock = LockService.getScriptLock();
-  lock.waitLock(20000);
-  try {
-    const wins = getList_('pending') || [];
-    PropertiesService.getScriptProperties().setProperty('pending', '[]');
-    return out({ wins: wins, checkedAt: Number(PropertiesService.getScriptProperties().getProperty('inboxCheckedAt') || 0) });
-  } finally {
-    lock.releaseLock();
-  }
-}
-
 /** Run to stop everything. */
 function stop() {
   ScriptApp.getProjectTriggers().forEach(function (t) { ScriptApp.deleteTrigger(t); });
 }
 
-// ---------- State (Script Properties) ----------
+// ---------- Web app (the PC calls this) ----------
 
-function getList_(key) {
-  const v = PropertiesService.getScriptProperties().getProperty(key);
-  return v ? JSON.parse(v) : null;
-}
-
-function setList_(key, list, cap) {
-  PropertiesService.getScriptProperties().setProperty(key, JSON.stringify(list.slice(-cap)));
-}
-
-// ---------- OzBargain feed ----------
-
-function decodeXml_(s) {
-  return (s || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
-    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
-    .replace(/&#039;|&#39;|&apos;/g, "'").replace(/&amp;/g, '&');
-}
-
-function tag_(xml, name) {
-  const m = xml.match(new RegExp('<' + name + '(?:\\s[^>]*)?>([\\s\\S]*?)</' + name + '>'));
-  return m ? decodeXml_(m[1]).trim() : '';
-}
-
-function attr_(tagText, name) {
-  const m = tagText.match(new RegExp('\\s' + name + '="([^"]*)"'));
-  return m ? decodeXml_(m[1]) : '';
-}
-
-function parseFeed(xml) {
-  const items = xml.match(/<item[\s>][\s\S]*?<\/item>/g) || [];
-  return items.map(function (item) {
-    const link = tag_(item, 'link');
-    const idMatch = link.match(/\/(?:competition|node)\/(\d+)/) || tag_(item, 'guid').match(/(\d+)/);
-    if (!idMatch) return null;
-    const desc = tag_(item, 'description');
-    const metaMatch = item.match(/<ozb:meta\b[^>]*>/);
-    const meta = metaMatch ? metaMatch[0] : '';
-    const categories = (item.match(/<category[^>]*>[\s\S]*?<\/category>/g) || [])
-      .map(function (c) { return decodeXml_(c.replace(/<\/?category[^>]*>/g, '')).trim(); });
-    let goUrl = attr_(meta, 'url');
-    if (goUrl.indexOf('/goto/') < 0) {
-      const g = desc.match(/href="([^"]*\/goto\/\d+)"/);
-      goUrl = g ? g[1] : '';
+/**
+ * Returns the possible wins waiting for the PC. They stay here until the PC confirms it has saved them
+ * by calling again with ack=<id>,<id>, so nothing is lost if the PC or its internet drops out midway.
+ */
+function doGet(e) {
+  const props = PropertiesService.getScriptProperties();
+  const key = props.getProperty('key');
+  const out = function (obj) { return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON); };
+  if (!e || !e.parameter || !key || e.parameter.key !== key) return out({ error: 'wrong key' });
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    migrateOldList_(props);
+    if (e.parameter.ack) {
+      e.parameter.ack.split(',').forEach(function (id) { if (id) props.deleteProperty('p:' + id); });
+      return out({ ok: true });
     }
-    if (goUrl.indexOf('/') === 0) goUrl = 'https://www.ozbargain.com.au' + goUrl;
-    if (!goUrl) goUrl = 'https://www.ozbargain.com.au/goto/' + idMatch[1];
-    return {
-      id: idMatch[1],
-      title: tag_(item, 'title'),
-      nodeUrl: link,
-      goUrl: goUrl,
-      categories: categories,
-      closing: attr_(meta, 'closing'),
-      text: desc.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(),
-    };
-  }).filter(Boolean);
-}
-
-function isWanted(comp, today) {
-  const excluded = EXCLUDE_CATEGORIES.map(function (c) { return c.toLowerCase(); });
-  if (comp.categories.some(function (c) { return excluded.indexOf(c.toLowerCase()) >= 0; })) return false;
-  const hay = (comp.title + ' ' + comp.text).toLowerCase();
-  if (EXCLUDE_KEYWORDS.some(function (k) { return hay.indexOf(k.toLowerCase()) >= 0; })) return false;
-  const closes = (comp.closing.match(/^\d{4}-\d{2}-\d{2}/) || [])[0];
-  if (closes && closes < today) return false;
-  return true;
-}
-
-function checkFeed() {
-  const res = UrlFetchApp.fetch(FEED_URL, { headers: { 'User-Agent': USER_AGENT }, muteHttpExceptions: true });
-  if (res.getResponseCode() !== 200) throw new Error('OzBargain feed returned HTTP ' + res.getResponseCode());
-  const today = Utilities.formatDate(new Date(), 'Australia/Sydney', 'yyyy-MM-dd');
-  const result = processFeed(res.getContentText(), getList_('seen'), today);
-  setList_('seen', result.seen, 700); // Script Properties values are limited to 9 KB
-  if (result.firstRun) {
-    postDiscord_('🎟️ Found **' + result.wanted.length + '** open comps that match your filters. ' +
-      'New ones will show up here as they’re posted.', result.wanted.map(compEmbed_));
-  } else if (result.wanted.length) {
-    postDiscord_('🎟️ **' + result.wanted.length + ' new comp' + (result.wanted.length === 1 ? '' : 's') +
-      '** on OzBargain. Tap a title to go to the entry page.', result.wanted.map(compEmbed_));
+    return out({ wins: waiting_(props), checkedAt: Number(props.getProperty('inboxCheckedAt') || 0), version: 2 });
+  } finally {
+    lock.releaseLock();
   }
 }
 
-/** Pure logic, separated for testing. seen is null on the first run. */
-function processFeed(xml, seen, today) {
-  const firstRun = seen === null;
-  seen = seen || [];
-  const wanted = [];
-  parseFeed(xml).forEach(function (c) {
-    if (seen.indexOf(c.id) >= 0) return;
-    seen.push(c.id);
-    if (isWanted(c, today)) wanted.push(c);
+function waiting_(props) {
+  const all = props.getProperties();
+  return Object.keys(all).filter(function (k) { return k.indexOf('p:') === 0; })
+    .map(function (k) { return JSON.parse(all[k]); })
+    .sort(function (a, b) { return (a.at || 0) - (b.at || 0); });
+}
+
+/** Older versions kept waiting wins in one list called "pending". */
+function migrateOldList_(props) {
+  const old = props.getProperty('pending');
+  if (old === null) return;
+  JSON.parse(old || '[]').forEach(function (w, i) {
+    w.id = w.id || ('old' + Date.now() + i);
+    w.at = w.at || Date.now();
+    props.setProperty('p:' + w.id, JSON.stringify(w));
   });
-  return { firstRun: firstRun, seen: seen, wanted: wanted };
+  props.deleteProperty('pending');
 }
 
-function compEmbed_(c) {
-  const fields = [];
-  if (c.closing) fields.push({ name: 'Closes', value: c.closing.slice(0, 16).replace('T', ' '), inline: true });
-  if (c.categories.length) fields.push({ name: 'Entry', value: c.categories.join(', ').slice(0, 1000), inline: true });
-  fields.push({ name: 'OzBargain', value: '[Comments and details](' + c.nodeUrl + ')', inline: false });
-  return { title: c.title.slice(0, 256), url: c.goUrl, color: 0x3498db, fields: fields };
-}
-
-// ---------- Inbox ----------
-
-function baseDomain(host) {
-  const parts = host.toLowerCase().replace(/\.$/, '').split('.');
-  if (parts.length >= 3 && SECOND_LEVEL.indexOf(parts[parts.length - 2]) >= 0 && parts[parts.length - 1].length === 2) {
-    return parts.slice(-3).join('.');
-  }
-  return parts.slice(-2).join('.');
-}
+// ---------- Win scoring ----------
 
 function norm_(text) {
-  return (text || '').toLowerCase().replace(/[\u2018\u2019]/g, "'");
+  return (text || '').toLowerCase().replace(/[‘’]/g, "'");
 }
 
 // Whole phrases only, so "you won" doesn't match "you won't" and "prize" doesn't match "prized".
@@ -207,6 +108,7 @@ function has_(text, list) {
   });
 }
 
+/** Same scoring as compbot/inbox.py score(), minus the points for brands you entered with (only the PC knows those). */
 function winScore(subject, body) {
   const s = norm_(subject), b = norm_(body);
   let points = 0;
@@ -220,6 +122,13 @@ function winScore(subject, body) {
 
 function looksLikeWin(subject, body) {
   return winScore(subject, body) >= 3;
+}
+
+// ---------- Inbox ----------
+
+function getList_(key) {
+  const v = PropertiesService.getScriptProperties().getProperty(key);
+  return v ? JSON.parse(v) : null;
 }
 
 function checkInbox() {
@@ -237,6 +146,7 @@ function checkInbox() {
     threads = threads.concat(page);
     if (page.length < 100) break;
   }
+  const me = Session.getEffectiveUser().getEmail();
   outer:
   for (let t = 0; t < threads.length; t++) {
     const thread = threads[t];
@@ -249,25 +159,18 @@ function checkInbox() {
       if (done.indexOf(id) >= 0) continue;
       done.push(id);
       const body = msg.getPlainBody().replace(/\s+/g, ' ').slice(0, 20000);
-      if (looksLikeWin(msg.getSubject(), body)) {
-        hits.push({ subject: msg.getSubject(), from: msg.getFrom(), snippet: body.slice(0, 300),
-          link: 'https://mail.google.com/mail/u/' + Session.getEffectiveUser().getEmail() + '/#all/' + thread.getId(), spam: thread.isInSpam() });
+      const score = winScore(msg.getSubject(), body);
+      if (score >= SEND_TO_PC_SCORE) {
+        hits.push({ id: id, at: Date.now(), score: score, subject: (msg.getSubject() || '').slice(0, 150),
+          from: (msg.getFrom() || '').slice(0, 100), snippet: body.slice(0, 200),
+          link: 'https://mail.google.com/mail/u/' + me + '/#all/' + thread.getId(), spam: thread.isInSpam() });
       }
     }
   }
-  setList_('emails', done, 300); // Script Properties values are limited to 9 KB
+  // Script Properties values are limited to 9 KB, so only the last 300 email ids are remembered.
+  props.setProperty('emails', JSON.stringify(done.slice(-300)));
+  queueForPc_(hits);
   props.setProperty('inboxCheckedAt', String(started));
-  if (PC_MODE) {
-    queueForPc_(hits);
-    return;
-  }
-  hits.forEach(function (h) {
-    const fields = [{ name: 'From', value: h.from.slice(0, 256) }];
-    if (h.spam) fields.push({ name: 'Folder', value: 'Spam' });
-    postDiscord_('\uD83C\uDFC6 **Possible competition win!** Check your email; claim deadlines can be short.', [{
-      title: (h.subject || '(no subject)').slice(0, 256), url: h.link, description: h.snippet, color: 0xf1c40f, fields: fields,
-    }]);
-  });
 }
 
 function queueForPc_(hits) {
@@ -275,33 +178,16 @@ function queueForPc_(hits) {
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
   try {
-    const pending = (getList_('pending') || []).concat(hits.map(function (h) {
-      return { subject: h.subject.slice(0, 150), from: h.from.slice(0, 100), snippet: h.snippet.slice(0, 200), link: h.link, spam: h.spam };
-    }));
-    setList_('pending', pending, 12); // Script Properties values are limited to 9 KB
+    const props = PropertiesService.getScriptProperties();
+    hits.forEach(function (h) { props.setProperty('p:' + h.id, JSON.stringify(h)); });
+    // If the PC has been off for a long time, drop the weakest, oldest ones first.
+    const waiting = waiting_(props);
+    if (waiting.length > MAX_WAITING) {
+      waiting.sort(function (a, b) { return (a.score || 3) - (b.score || 3) || (a.at || 0) - (b.at || 0); })
+        .slice(0, waiting.length - MAX_WAITING)
+        .forEach(function (w) { props.deleteProperty('p:' + w.id); });
+    }
   } finally {
     lock.releaseLock();
-  }
-}
-
-// ---------- Discord ----------
-
-function postDiscord_(content, embeds) {
-  embeds = embeds || [];
-  for (let i = 0; i === 0 || i < embeds.length; i += 10) {
-    const payload = { content: i === 0 ? content : '', embeds: embeds.slice(i, i + 10) };
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const res = UrlFetchApp.fetch(DISCORD_WEBHOOK, {
-        method: 'post', contentType: 'application/json', payload: JSON.stringify(payload), muteHttpExceptions: true,
-      });
-      if (res.getResponseCode() === 429) {
-        let wait = 2;
-        try { wait = JSON.parse(res.getContentText()).retry_after || 2; } catch (e) {}
-        Utilities.sleep(Math.min(10, Math.ceil(wait)) * 1000);
-        continue;
-      }
-      if (res.getResponseCode() >= 300) throw new Error('Discord returned HTTP ' + res.getResponseCode() + ': ' + res.getContentText());
-      break;
-    }
   }
 }

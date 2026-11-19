@@ -1,5 +1,6 @@
 import email.message
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -197,41 +198,135 @@ def test_prefill_form(tmp_path):
         browser.close()
 
 
-def test_inbox_relay_tiers(monkeypatch, tmp_path):
-    sent = []
-    monkeypatch.setattr(inbox.discord, "post",
-                        lambda url, content, embeds=None, silent=False: sent.append((content, embeds, silent)))
-    wins = [
-        {"subject": "You've won!", "from": "Clipsal Home <promo@clipsal.com.au>", "snippet": "", "link": "x", "spam": False},
-        {"subject": "You've won!", "from": "Promos <hello@salty-aura.com>", "snippet": "", "link": "x", "spam": True},
-        {"subject": "You've won an iPhone!", "from": "Lucky <win@scam.biz>", "snippet": "", "link": "x", "spam": False},
-        {"subject": "You've won an iPad!", "from": "Lucky <win@scam.biz>", "snippet": "", "link": "x", "spam": True},
-    ]
+class FakeRelay:
+    """Stands in for the Google script's web app: hands out waiting wins until they're acknowledged."""
 
-    class Resp:
-        def raise_for_status(self): pass
-        def json(self): return {"wins": wins}
+    def __init__(self, wins, checked_at=None):
+        self.wins = {w.get("id") or str(i): w for i, w in enumerate(wins)}
+        self.checked_at = checked_at if checked_at is not None else time.time() * 1000
+        self.acks = []
 
-    monkeypatch.setattr(inbox.requests, "get", lambda url, timeout: Resp())
-    conn = db.connect(tmp_path / "t.db")
+    def get(self, url, params=None, timeout=None):
+        if params and "ack" in params:
+            self.acks.append(params["ack"])
+            for i in params["ack"].split(","):
+                self.wins.pop(i, None)
+            body = {"ok": True}
+        else:
+            body = {"wins": list(self.wins.values()), "checkedAt": self.checked_at}
+
+        class Resp:
+            def raise_for_status(self): pass
+            def json(self): return body
+        return Resp()
+
+
+def _entered(conn):
     for node, title, domain in (("1", "Win a Smeg Toaster from Clipsal Home", "www.clipsal.com"),
                                 ("2", "Win a $1,000 Voucher from Salty Aura", "gleam.io")):
         conn.execute("INSERT INTO comps (node_id, title, node_url, first_seen, status, entry_domain) "
                      "VALUES (?, ?, 'u', 'now', 'entered', ?)", (node, title, domain))
     conn.commit()
+
+
+def test_inbox_relay_tiers(monkeypatch, tmp_path):
+    sent = []
+    monkeypatch.setattr(inbox.discord, "post",
+                        lambda url, content, embeds=None, silent=False: sent.append((content, embeds, silent)))
+    relay = FakeRelay([
+        {"id": "a", "score": 3, "subject": "You've won!", "from": "Clipsal Home <promo@clipsal.com.au>", "snippet": "", "link": "x", "spam": False},
+        {"id": "b", "score": 3, "subject": "You've won!", "from": "Promos <hello@salty-aura.com>", "snippet": "", "link": "x", "spam": True},
+        {"id": "c", "score": 3, "subject": "You've won an iPhone!", "from": "Lucky <win@scam.biz>", "snippet": "", "link": "x", "spam": False},
+        {"id": "d", "score": 3, "subject": "You've won an iPad!", "from": "Lucky <win@scam.biz>", "snippet": "", "link": "x", "spam": True},
+        # Borderline: only a point or two on its own, enough with a brand you entered.
+        {"id": "e", "score": 1, "subject": "Your prize from Clipsal", "from": "Clipsal Home <hi@clipsal.com.au>", "snippet": "", "link": "x", "spam": False},
+        {"id": "f", "score": 1, "subject": "Prize season sale", "from": "Shop <hi@shop.com>", "snippet": "", "link": "x", "spam": False},
+    ])
+    monkeypatch.setattr(inbox.requests, "get", relay.get)
+    conn = db.connect(tmp_path / "t.db")
+    _entered(conn)
     c = cfg()
     c.gmail_relay_url = "https://script.google.com/macros/s/x/exec?key=k"
 
     hits = inbox.check(c, conn)
-    # Known brands ping (even from spam); the unknown inbox email is posted quietly; unknown spam is dropped.
-    assert len(hits) == 3
-    assert [s_[2] for s_ in sent] == [False, False, True]
+    # Known brands ping (even from spam or when borderline); unknown ones are posted quietly, spam included.
+    assert [h["id"] for h in hits] == ["a", "b", "c", "d", "e"]
+    assert [s_[2] for s_ in sent] == [False, False, True, True, False]
     assert "brand you entered" in sent[0][0]
     assert sent[1][1][0]["fields"][1] == {"name": "Folder", "value": "Spam"}
+    assert "spam folder" in sent[3][0]
+    assert relay.wins == {}  # all acknowledged
 
-    sent.clear()
+    # Nothing is posted twice, even if the script hands the same email over again.
+    relay.wins = {"a": {"id": "a", "score": 3, "subject": "You've won!", "from": "Clipsal Home <promo@clipsal.com.au>"}}
+    assert inbox.check(c, conn) == []
+
+
+def test_inbox_relay_ignore_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr(inbox.discord, "post", lambda *a, **k: None)
+    relay = FakeRelay([
+        {"id": "a", "score": 3, "subject": "You've won!", "from": "Clipsal Home <promo@clipsal.com.au>", "spam": False},
+        {"id": "c", "score": 3, "subject": "You've won an iPhone!", "from": "Lucky <win@scam.biz>", "spam": False},
+    ])
+    monkeypatch.setattr(inbox.requests, "get", relay.get)
+    conn = db.connect(tmp_path / "t.db")
+    _entered(conn)
+    c = cfg()
+    c.gmail_relay_url = "https://x/exec?key=k"
     c.unknown_senders = "ignore"
-    assert len(inbox.check(c, conn)) == 2
+    assert [h["id"] for h in inbox.check(c, conn)] == ["a"]
+
+
+def test_inbox_relay_keeps_wins_when_discord_fails(monkeypatch, tmp_path):
+    relay = FakeRelay([{"id": "a", "score": 3, "subject": "You've won!", "from": "x <a@b.com>", "spam": False}])
+    monkeypatch.setattr(inbox.requests, "get", relay.get)
+
+    def down(*a, **k):
+        raise RuntimeError("Discord is down")
+    monkeypatch.setattr(inbox.discord, "post", down)
+    conn = db.connect(tmp_path / "t.db")
+    c = cfg()
+    c.gmail_relay_url = "https://x/exec?key=k"
+    with pytest.raises(RuntimeError):
+        inbox.check(c, conn)
+    assert relay.wins == {}  # the script was told it's safe here
+
+    sent = []
+    monkeypatch.setattr(inbox.discord, "post", lambda url, content, embeds=None, silent=False: sent.append(embeds))
+    assert len(inbox.check(c, conn)) == 1  # retried on the next check
+    assert sent[0][0]["title"] == "You've won!"
+
+
+def test_inbox_relay_old_script_without_ids(monkeypatch, tmp_path):
+    """The previous script version sends no id or score and deletes wins itself."""
+    monkeypatch.setattr(inbox.discord, "post", lambda *a, **k: None)
+    wins = [{"subject": "You've won!", "from": "x <a@b.com>", "snippet": "", "link": "l", "spam": False}]
+
+    class Resp:
+        def raise_for_status(self): pass
+        def json(self): return {"wins": wins}
+    monkeypatch.setattr(inbox.requests, "get", lambda url, params=None, timeout=None: Resp())
+    conn = db.connect(tmp_path / "t.db")
+    c = cfg()
+    c.gmail_relay_url = "https://x/exec?key=k"
+    assert len(inbox.check(c, conn)) == 1
+    assert inbox.check(c, conn) == []
+
+
+def test_inbox_relay_warns_when_script_stops(monkeypatch, tmp_path):
+    sent = []
+    monkeypatch.setattr(inbox.discord, "post", lambda url, content, embeds=None, silent=False: sent.append(content))
+    relay = FakeRelay([], checked_at=(time.time() - 5 * 3600) * 1000)
+    monkeypatch.setattr(inbox.requests, "get", relay.get)
+    conn = db.connect(tmp_path / "t.db")
+    c = cfg()
+    c.gmail_relay_url = "https://x/exec?key=k"
+    inbox.check(c, conn)
+    inbox.check(c, conn)
+    assert len(sent) == 1 and "hasn't checked your Gmail for 5 hours" in sent[0]
+    relay.checked_at = time.time() * 1000
+    inbox.check(c, conn)
+    assert len(sent) == 2 and "checking your Gmail again" in sent[1]
 
 
 def test_entered_brands(tmp_path):
@@ -510,3 +605,42 @@ def test_gleam_comps_hidden(tmp_path):
                      "VALUES (?, 't', 'u', 'x', 'new', ?, '2099-01-01')", (node, cats))
     assert [r["node_id"] for r in entry.pending(conn)] == ["1"]
     assert sorted(r["node_id"] for r in entry.pending(conn, skip_gleam=False)) == ["1", "2"]
+
+
+DOB_FORM = """<!doctype html><html><body><form>
+  <div class="a"><label>Date of birth</label>
+    <select name="dob_day"><option value="">Day</option>""" + "".join(f"<option>{i}</option>" for i in range(1, 32)) + """</select>
+    <select name="dob_month"><option value="">Month</option>""" + "".join(
+        f"<option value='{i}'>{n}</option>" for i, n in enumerate(
+            ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+             "November", "December"], 1)) + """</select>
+    <select name="dob_year"><option value="">Year</option>""" + "".join(f"<option>{y}</option>" for y in range(2008, 1930, -1)) + """</select>
+  </div>
+  <div class="b"><span>Birthday</span>
+    <input name="bd" placeholder="DD" maxlength="2"><input name="bm" placeholder="MM" maxlength="2"><input name="by" placeholder="YYYY" maxlength="4">
+  </div>
+  <div class="c"><label>Your date of birth <input name="dob_text" placeholder="dd-mm-yyyy"></label></div>
+  <div class="d"><label>Date of birth <input name="dob_plain"></label></div>
+</form></body></html>"""
+
+
+def test_prefill_split_date_of_birth(tmp_path):
+    pw_api = pytest.importorskip("playwright.sync_api")
+    from compbot.entry import prefill_all_frames
+
+    (tmp_path / "dob.html").write_text(DOB_FORM)
+    with pw_api.sync_playwright() as pw:
+        exe = "/opt/pw-browsers/chromium" if Path("/opt/pw-browsers/chromium").exists() else None
+        try:
+            browser = pw.chromium.launch(executable_path=exe) if exe else pw.chromium.launch()
+        except Exception as e:
+            pytest.skip(f"no browser: {e}")
+        page = browser.new_page()
+        page.goto((tmp_path / "dob.html").as_uri())
+        prefill_all_frames(page, {"date_of_birth": "1995-03-04"})
+        v = lambda sel: page.eval_on_selector(sel, "e => e.value")
+        assert (v("[name=dob_day]"), v("[name=dob_month]"), v("[name=dob_year]")) == ("4", "3", "1995")
+        assert (v("[name=bd]"), v("[name=bm]"), v("[name=by]")) == ("04", "03", "1995")
+        assert v("[name=dob_text]") == "04-03-1995"
+        assert v("[name=dob_plain]") == "04/03/1995"
+        browser.close()
