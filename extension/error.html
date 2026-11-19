@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Comp page didn't load</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 600px; margin: 64px auto; padding: 0 16px; color: #1b1b1b; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .muted { color: #666; font-size: 14px; word-break: break-all; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 20px; }
+  button { font: 600 15px system-ui, sans-serif; border-radius: 8px; border: 1px solid #c9c9c9; background: #f4f4f4;
+           padding: 9px 16px; cursor: pointer; }
+  button.main { background: #1f7a4d; border-color: #1f7a4d; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+</style>
+<h1>This comp's page didn't load</h1>
+<p id="title"></p>
+<p class="muted">The site may be down or the link may be broken. <span id="err"></span><br><span id="url"></span></p>
+<div class="row">
+  <button class="main" data-k="s" title="Never show this comp again">Skip it</button>
+  <button data-k="l" title="Show it again next time">Later</button>
+  <button data-k="retry">Try again</button>
+</div>
+<p class="muted">Shortcuts work here too: Alt+Shift+S skip, Alt+Shift+L later.</p>
+<script src="error.js"></script>

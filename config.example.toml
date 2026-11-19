@@ -34,6 +34,9 @@ exclude_categories = ["Purchase Required", "Recruit/Referral"]
 exclude_keywords = ["new zealand only", "nz only", "nz residents only", "usa only", "us residents only", "uk only"]
 # Hide comps run on Gleam (OzBargain's "Gleam" tag, or gleam.io / gle.am links). Set to false to see them again.
 exclude_gleam = true
+# Hide comps entered on Instagram (OzBargain's "Instagram" tag, instagram.com links, or Instagram in the
+# title or description). Set to false to see them again.
+exclude_instagram = true
 
 [inbox]
 # Win-like emails from a brand or site you've entered a comp with (pressed "e" in Enter comps) always ping you.

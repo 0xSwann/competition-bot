@@ -55,6 +55,7 @@ When the Google script changes: paste the new `phone/Code.gs` into script.google
 
 - `exclude_categories`: OzBargain tags to hide. The default hides *Purchase Required* and *Recruit/Referral*. Add `"Like/Follow/Comment/Share"` to hide those too.
 - `exclude_gleam`: hides comps run on Gleam (tagged *Gleam* on OzBargain, or linking to gleam.io / gle.am). On by default; set it to `false` to see them again.
+- `exclude_instagram`: hides comps entered on Instagram (tagged *Instagram* on OzBargain, linking to instagram.com, or mentioning Instagram in the title or description). On by default; set it to `false` to see them again.
 - `exclude_keywords`: hides comps whose title or description contains these words (default: NZ-, US- and UK-only).
 - `state` under `[me]`: comps limited to other states are hidden.
 - `unknown_senders` under `[inbox]`: what happens with win-like emails from senders you haven't entered with. `quiet` (default) posts them without a ping, `ignore` drops them, `alert` pings like a real win.

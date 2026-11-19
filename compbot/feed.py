@@ -104,8 +104,28 @@ def is_gleam(comp) -> bool:
     return bool(_GLEAM_DOMAIN.search(hay))
 
 
+_INSTAGRAM = re.compile(r"\binstagram\b|\binstagr\.am\b|\binsta\b|\big\s+(?:post|story|stories|reel|comp|giveaway)", re.I)
+
+
+def is_instagram(comp) -> bool:
+    """True if the comp is entered on Instagram: OzBargain's "Instagram" tag, an instagram.com link,
+    or Instagram mentioned in its title or description."""
+    get = comp.get if isinstance(comp, dict) else (lambda k, d="": comp[k] if k in comp.keys() else d)
+    cats = [c.strip().lower() for c in (get("categories", "") or "").split(",")]
+    if any("instagram" in c for c in cats):
+        return True
+    hay = " ".join(str(get(k, "") or "") for k in ("title", "text", "go_url", "node_url"))
+    return bool(_INSTAGRAM.search(hay))
+
+
+def is_hidden_platform(comp, cfg) -> bool:
+    """Gleam and Instagram comps, when config.toml hides them."""
+    return ((getattr(cfg, "exclude_gleam", True) and is_gleam(comp))
+            or (getattr(cfg, "exclude_instagram", True) and is_instagram(comp)))
+
+
 def is_wanted(comp: dict, cfg) -> bool:
-    if getattr(cfg, "exclude_gleam", True) and is_gleam(comp):
+    if is_hidden_platform(comp, cfg):
         return False
     cats = [c.strip().lower() for c in comp["categories"].split(",") if c.strip()]
     if any(c in cfg.exclude_categories for c in cats):
