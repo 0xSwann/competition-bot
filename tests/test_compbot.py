@@ -677,3 +677,118 @@ def test_background_status(tmp_path, monkeypatch):
     assert entry.background_status(conn) == "OzBargain last checked 12 min ago."
     db.set_state(conn, "heartbeat", (now - timedelta(hours=1)).isoformat())
     assert "wasn't running" in entry.background_status(conn)
+
+
+def test_extension_prefill_in_sync():
+    from compbot import entry
+    assert (entry.EXTENSION_DIR / "prefill.js").read_text(encoding="utf-8") == entry.extension_prefill_js()
+
+
+def test_helper_rejects_web_pages():
+    import http.client
+    import json as _json
+    from compbot import helper
+    session = helper.Session([{"node_id": "1", "title": "Win $5", "go_url": "https://example.com/c", "categories": "",
+                               "closing": "", "status": "new"}], {"first_name": "Lou"})
+    server = helper.start(session)
+    if server is None:
+        pytest.skip("helper port busy")
+
+    def get(path, headers=None):
+        h = http.client.HTTPConnection("127.0.0.1", helper.PORT, timeout=5)
+        h.request("GET", path, headers=headers or {})
+        r = h.getresponse()
+        return r.status, r.getheader("Location"), r.read()
+    try:
+        assert get("/api/current")[0] == 403  # no header: a web page can't read your details
+        assert get("/api/current", {"X-Compbot": "1", "Origin": "https://evil.example"})[0] == 403
+        status, _, body = get("/api/current", {"X-Compbot": "1"})
+        assert status == 200 and _json.loads(body)["title"] == "Win $5"
+        assert get("/go?direct=1")[:2] == (302, "https://example.com/c")
+        assert b"https://example.com/c" in get("/go")[2]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+EXT_FORM = """<!doctype html><title>Comp {n}</title><form>
+<label>First name <input name="first_name"></label><label>Email <input type="email" name="email"></label>
+<button type="button">Enter</button></form>"""
+
+
+def test_extension_end_to_end(tmp_path, monkeypatch):
+    """Loads the real extension in Chromium: fill, Entered, Skip, then the all-done page."""
+    import http.server
+    import os
+    import queue as _queue
+    import threading
+    pw_api = pytest.importorskip("playwright.sync_api")
+    from compbot import entry, helper
+
+    site = tmp_path / "site"
+    site.mkdir()
+    for n in (1, 2):  # go_url must look like OzBargain's /goto/ links
+        (site / "goto" / str(n)).mkdir(parents=True)
+        (site / "goto" / str(n) / "index.html").write_text(EXT_FORM.format(n=n))
+    handler = lambda *a, **k: http.server.SimpleHTTPRequestHandler(*a, directory=str(site), **k)
+    handler.log_message = lambda *a: None
+    web = http.server.ThreadingHTTPServer(("127.0.0.2", 0), handler)
+    threading.Thread(target=web.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.2:{web.server_address[1]}"
+
+    conn_path = tmp_path / "e.db"
+    conn = db.connect(conn_path)
+    for node, title in (("1", "Win a $900 Bike from Acme"), ("2", "Win a Hat")):
+        conn.execute("INSERT INTO comps (node_id, title, node_url, go_url, first_seen, closing) VALUES (?, ?, 'u', ?, 'x', '2099-01-01')",
+                     (node, title, f"{base}/goto/{node}/"))
+    conn.commit()
+    conn.close()
+
+    opened = _queue.Queue()
+    monkeypatch.setattr(entry, "open_url", lambda cfg, url: opened.put(url))
+    c = cfg()
+    c.me = {"first_name": "Lou", "email": "lou@example.com"}
+    c.close_tabs = False
+    r_fd, w_fd = os.pipe()  # a terminal nobody types in
+
+    def run():
+        conn2 = db.connect(conn_path)
+        entry.run_normal(c, conn2, entry.pending(conn2), keys=os.fdopen(r_fd))
+    worker = threading.Thread(target=run, daemon=True)
+
+    exe = "/opt/pw-browsers/chromium" if Path("/opt/pw-browsers/chromium").exists() else None
+    with pw_api.sync_playwright() as pw:
+        try:
+            ctx = pw.chromium.launch_persistent_context(
+                str(tmp_path / "profile"), executable_path=exe, headless=True,
+                args=["--proxy-server=direct://", f"--disable-extensions-except={entry.EXTENSION_DIR}",
+                      f"--load-extension={entry.EXTENSION_DIR}"])
+        except Exception as e:
+            pytest.skip(f"no browser: {e}")
+        try:
+            if not ctx.service_workers:
+                ctx.wait_for_event("serviceworker", timeout=10000)
+            worker.start()
+            page = ctx.new_page()
+            page.goto(opened.get(timeout=10))
+            bar = page.locator("text=Comp 1 of 2")
+            bar.wait_for(timeout=10000)
+            assert page.locator("text=about $900").count() == 1
+            page.get_by_role("button", name="Fill my details").click()
+            page.wait_for_function("document.querySelector('[name=email]').value === 'lou@example.com'", timeout=5000)
+            assert page.eval_on_selector("[name=first_name]", "e => e.value") == "Lou"
+            page.get_by_role("button", name="Entered").click()
+            page.locator("text=Comp 2 of 2").wait_for(timeout=10000)
+            assert page.url.endswith("/goto/2/")
+            os.write(w_fd, b"s\n")  # pressed in the terminal instead: the tab catches up by itself
+            page.locator("text=All done").wait_for(timeout=10000)
+            assert "1 entered" in page.inner_text("#summary")
+            worker.join(10)
+            assert not worker.is_alive()
+        finally:
+            ctx.close()
+            web.shutdown()
+    conn = db.connect(conn_path)
+    rows = dict(conn.execute("SELECT node_id, status FROM comps").fetchall())
+    assert rows == {"1": "entered", "2": "skipped"}
+    assert conn.execute("SELECT entry_domain FROM comps WHERE node_id = '1'").fetchone()[0] == "127.0.0.2"

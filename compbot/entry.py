@@ -1,7 +1,9 @@
 """Entry helper: opens each new comp in a browser, pre-fills your details, and you submit."""
 import json
 import os
+import queue
 import subprocess
+import threading
 import time
 import webbrowser
 from datetime import date, datetime, timezone
@@ -237,45 +239,107 @@ def _record(conn, comp, choice, host="", started=None):
     conn.commit()
 
 
-def run_normal(cfg, conn, todo) -> None:
+def _read_keys(session, keys=None) -> None:
+    """Passes what you type in the terminal to the main loop, alongside the extension's buttons."""
+    import sys
+    for line in keys or sys.stdin:
+        session.actions.put(("terminal", line.strip().lower()[:1], [], None))
+    session.actions.put(("terminal", "q", [], None))  # the window was closed
+
+
+EXTENSION_DIR = Path(__file__).resolve().parent.parent / "extension"
+
+
+def extension_prefill_js() -> str:
+    return ("// Generated from compbot/prefill.js when Enter comps starts. Edit that file, not this one.\n"
+            "self.compbotPrefill = " + PREFILL_JS.rstrip() + ";\n")
+
+
+def sync_extension() -> None:
+    """Keeps the extension's copy of the form filler the same as compbot/prefill.js."""
+    target = EXTENSION_DIR / "prefill.js"
+    try:
+        if target.parent.exists() and (not target.exists() or target.read_text(encoding="utf-8") != extension_prefill_js()):
+            target.write_text(extension_prefill_js(), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def run_normal(cfg, conn, todo, keys=None) -> None:
+    """Opens each comp in your own Chrome. The Competition bot extension fills the form and puts
+    Entered / Skip / Later buttons on the page; the keys here work too."""
+    from . import helper
+
+    sync_extension()
+
+    session = helper.Session(todo, cfg.me)
+    if helper.start(session) is None:
+        print("Enter comps already seems to be open in another window. Use that one, or close it and try again.")
+        return
     session_start = db.now()
-    if not BOOKMARK_PAGE.exists():
-        open_url(cfg, write_bookmark_page(cfg.me).as_uri())
-        print("First time: a page opened in your browser. Drag its \"Fill my details\" button onto your\n"
-              "bookmarks bar, then come back here and press Enter.")
-        input()
     print(f"{len(todo)} comp(s) to go: closing soon first, then biggest prizes.\n"
-          "Each one opens in your browser. Click \"Fill my details\" on the entry form, check it, do any\n"
-          "CAPTCHA or written answer, tick the boxes you agree to, then submit it yourself.")
-    prompt = ("\n  [e] I entered it   [s] skip for good   [l] later   [o] open it again   [q] quit\n"
-              "  (e and s also close the comp's tab, so stay on it until you press them)\n  > "
-              if cfg.close_tabs else
-              "\n  [e] I entered it   [s] skip for good   [l] later   [o] open it again   [q] quit\n  > ")
-    for i, comp in enumerate(todo, 1):
-        print(f"\n[{i}/{len(todo)}] {comp['title']}")
+          "Each one opens in Chrome. Fill in your details (the extension's Fill button, Alt+Shift+F), check them,\n"
+          "do any CAPTCHA or written answer, tick the boxes you agree to, and submit it yourself. Then press\n"
+          "Entered, Skip or Later on the page (or Alt+Shift+E / S / L), or type e, s, l here.")
+    prompt = "\n  [e] entered   [s] skip for good   [l] later   [o] open it again   [q] quit\n  > "
+    threading.Thread(target=_read_keys, args=(session, keys), daemon=True).start()
+    hinted = False
+
+    while session.comp is not None:
+        comp = session.comp
+        print(f"\n[{session.i + 1}/{len(session.todo)}] {comp['title']}")
         print(describe(comp))
         started = time.monotonic()
-        open_url(cfg, comp["go_url"])
+        if not session.extension_active():
+            open_url(cfg, helper.BASE + "/go")  # the extension takes over this tab and moves it along from here
+        print(prompt, end="", flush=True)
         while True:
-            choice = input(prompt).strip().lower()[:1]
-            if choice == "o":
-                open_url(cfg, comp["go_url"])
+            try:
+                source, choice, hosts, done = session.actions.get(timeout=12)
+            except queue.Empty:
+                if not hinted and not session.extension_active(60):
+                    hinted = True
+                    print("\n  (The Chrome extension isn't connected. See \"Chrome extension\" in README.md to add it,"
+                          "\n   or use the Fill my details bookmark and the keys here.)" + prompt, end="", flush=True)
                 continue
-            if choice in ("e", "s", "l", "q"):
+            if choice == "o":
+                open_url(cfg, helper.BASE + "/go")
+                print(prompt, end="", flush=True)
+                continue
+            if choice in ACTIONS:
                 break
-        _record(conn, comp, choice, started=started)
+            if source == "terminal":
+                print(prompt, end="", flush=True)
+        _record(conn, comp, choice, host=" ".join(hosts), started=started)
+        if source == "extension":
+            print({"e": "entered", "s": "skipped", "l": "later", "q": "quit"}[choice] + " (from Chrome)")
+        elif choice in ("e", "s") and cfg.close_tabs and not session.extension_active():
+            if not close_active_chrome_tab():
+                print("  (Couldn't close the tab automatically; close it yourself.)")
         if choice == "q":
+            session.finish(_session_line(conn, session_start))
+            if done:
+                done.set()
             break
-        if choice in ("e", "s") and cfg.close_tabs and not close_active_chrome_tab():
-            print("  (Couldn't close the tab automatically; close it yourself.)")
+        session.advance()
+        if session.comp is None:
+            session.finish(_session_line(conn, session_start))
+        if done:
+            done.set()
+    if session.comp is None and not session.summary:
+        session.finish(_session_line(conn, session_start))
     _goodbye(conn, session_start)
 
 
-def _goodbye(conn, session_start: str) -> None:
+def _session_line(conn, session_start: str) -> str:
     row = conn.execute(
         "SELECT SUM(action = 'entered'), COALESCE(SUM(seconds), 0) FROM entries WHERE at >= ?", (session_start,)
     ).fetchone()
-    print(f"\nDone. This session: {row[0] or 0} entered in {stats._duration(row[1])}.")
+    return f"This session: {row[0] or 0} entered in {stats._duration(row[1])}."
+
+
+def _goodbye(conn, session_start: str) -> None:
+    print(f"\nDone. {_session_line(conn, session_start)}")
     print(f"All time: {stats.summary(conn)['entered']} entered. Double-click Comp stats for the full picture.")
 
 
