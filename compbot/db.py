@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS entries (
     prize_value REAL,
     won_at      TEXT
 );
+CREATE TABLE IF NOT EXISTS alerts (
+    id          TEXT PRIMARY KEY,  -- the Gmail message id, so the same email is never posted twice
+    data        TEXT NOT NULL,     -- JSON of the possible win, kept until it reaches Discord
+    received_at TEXT NOT NULL,
+    posted_at   TEXT
+);
 CREATE TABLE IF NOT EXISTS state (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -51,8 +57,11 @@ def connect(path=None) -> sqlite3.Connection:
     if path is None:
         DATA_DIR.mkdir(exist_ok=True)
         path = DATA_DIR / "compbot.sqlite3"
-    conn = sqlite3.connect(path)
+    # The background task and Enter comps share this file: wait for each other instead of failing.
+    conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
+    if str(path) != ":memory:":
+        conn.execute("PRAGMA journal_mode=WAL")
     had_entries = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'entries'").fetchone()
     conn.executescript(SCHEMA)
     if not had_entries:

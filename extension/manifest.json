@@ -1,0 +1,67 @@
+{
+  "manifest_version": 3,
+  "name": "Competition bot",
+  "version": "1.0",
+  "description": "Fills entry forms with your details and lets you mark comps entered, skipped or later from the page. Never submits anything.",
+  "permissions": [
+    "scripting",
+    "storage",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Fill my details (Alt+Shift+F)"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://127.0.0.1:47615/go*"
+      ],
+      "js": [
+        "go.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "panel.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "fill": {
+      "suggested_key": {
+        "default": "Alt+Shift+F"
+      },
+      "description": "Fill my details"
+    },
+    "entered": {
+      "suggested_key": {
+        "default": "Alt+Shift+E"
+      },
+      "description": "I entered it: go to the next comp"
+    },
+    "skip": {
+      "suggested_key": {
+        "default": "Alt+Shift+S"
+      },
+      "description": "Skip it for good: go to the next comp"
+    },
+    "later": {
+      "suggested_key": {
+        "default": "Alt+Shift+L"
+      },
+      "description": "Later: go to the next comp"
+    }
+  }
+}

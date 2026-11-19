@@ -1,5 +1,7 @@
 import email.message
 import re
+import time
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -197,41 +199,135 @@ def test_prefill_form(tmp_path):
         browser.close()
 
 
-def test_inbox_relay_tiers(monkeypatch, tmp_path):
-    sent = []
-    monkeypatch.setattr(inbox.discord, "post",
-                        lambda url, content, embeds=None, silent=False: sent.append((content, embeds, silent)))
-    wins = [
-        {"subject": "You've won!", "from": "Clipsal Home <promo@clipsal.com.au>", "snippet": "", "link": "x", "spam": False},
-        {"subject": "You've won!", "from": "Promos <hello@salty-aura.com>", "snippet": "", "link": "x", "spam": True},
-        {"subject": "You've won an iPhone!", "from": "Lucky <win@scam.biz>", "snippet": "", "link": "x", "spam": False},
-        {"subject": "You've won an iPad!", "from": "Lucky <win@scam.biz>", "snippet": "", "link": "x", "spam": True},
-    ]
+class FakeRelay:
+    """Stands in for the Google script's web app: hands out waiting wins until they're acknowledged."""
 
-    class Resp:
-        def raise_for_status(self): pass
-        def json(self): return {"wins": wins}
+    def __init__(self, wins, checked_at=None):
+        self.wins = {w.get("id") or str(i): w for i, w in enumerate(wins)}
+        self.checked_at = checked_at if checked_at is not None else time.time() * 1000
+        self.acks = []
 
-    monkeypatch.setattr(inbox.requests, "get", lambda url, timeout: Resp())
-    conn = db.connect(tmp_path / "t.db")
+    def get(self, url, params=None, timeout=None):
+        if params and "ack" in params:
+            self.acks.append(params["ack"])
+            for i in params["ack"].split(","):
+                self.wins.pop(i, None)
+            body = {"ok": True}
+        else:
+            body = {"wins": list(self.wins.values()), "checkedAt": self.checked_at}
+
+        class Resp:
+            def raise_for_status(self): pass
+            def json(self): return body
+        return Resp()
+
+
+def _entered(conn):
     for node, title, domain in (("1", "Win a Smeg Toaster from Clipsal Home", "www.clipsal.com"),
                                 ("2", "Win a $1,000 Voucher from Salty Aura", "gleam.io")):
         conn.execute("INSERT INTO comps (node_id, title, node_url, first_seen, status, entry_domain) "
                      "VALUES (?, ?, 'u', 'now', 'entered', ?)", (node, title, domain))
     conn.commit()
+
+
+def test_inbox_relay_tiers(monkeypatch, tmp_path):
+    sent = []
+    monkeypatch.setattr(inbox.discord, "post",
+                        lambda url, content, embeds=None, silent=False: sent.append((content, embeds, silent)))
+    relay = FakeRelay([
+        {"id": "a", "score": 3, "subject": "You've won!", "from": "Clipsal Home <promo@clipsal.com.au>", "snippet": "", "link": "x", "spam": False},
+        {"id": "b", "score": 3, "subject": "You've won!", "from": "Promos <hello@salty-aura.com>", "snippet": "", "link": "x", "spam": True},
+        {"id": "c", "score": 3, "subject": "You've won an iPhone!", "from": "Lucky <win@scam.biz>", "snippet": "", "link": "x", "spam": False},
+        {"id": "d", "score": 3, "subject": "You've won an iPad!", "from": "Lucky <win@scam.biz>", "snippet": "", "link": "x", "spam": True},
+        # Borderline: only a point or two on its own, enough with a brand you entered.
+        {"id": "e", "score": 1, "subject": "Your prize from Clipsal", "from": "Clipsal Home <hi@clipsal.com.au>", "snippet": "", "link": "x", "spam": False},
+        {"id": "f", "score": 1, "subject": "Prize season sale", "from": "Shop <hi@shop.com>", "snippet": "", "link": "x", "spam": False},
+    ])
+    monkeypatch.setattr(inbox.requests, "get", relay.get)
+    conn = db.connect(tmp_path / "t.db")
+    _entered(conn)
     c = cfg()
     c.gmail_relay_url = "https://script.google.com/macros/s/x/exec?key=k"
 
     hits = inbox.check(c, conn)
-    # Known brands ping (even from spam); the unknown inbox email is posted quietly; unknown spam is dropped.
-    assert len(hits) == 3
-    assert [s_[2] for s_ in sent] == [False, False, True]
+    # Known brands ping (even from spam or when borderline); unknown ones are posted quietly, spam included.
+    assert [h["id"] for h in hits] == ["a", "b", "c", "d", "e"]
+    assert [s_[2] for s_ in sent] == [False, False, True, True, False]
     assert "brand you entered" in sent[0][0]
     assert sent[1][1][0]["fields"][1] == {"name": "Folder", "value": "Spam"}
+    assert "spam folder" in sent[3][0]
+    assert relay.wins == {}  # all acknowledged
 
-    sent.clear()
+    # Nothing is posted twice, even if the script hands the same email over again.
+    relay.wins = {"a": {"id": "a", "score": 3, "subject": "You've won!", "from": "Clipsal Home <promo@clipsal.com.au>"}}
+    assert inbox.check(c, conn) == []
+
+
+def test_inbox_relay_ignore_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr(inbox.discord, "post", lambda *a, **k: None)
+    relay = FakeRelay([
+        {"id": "a", "score": 3, "subject": "You've won!", "from": "Clipsal Home <promo@clipsal.com.au>", "spam": False},
+        {"id": "c", "score": 3, "subject": "You've won an iPhone!", "from": "Lucky <win@scam.biz>", "spam": False},
+    ])
+    monkeypatch.setattr(inbox.requests, "get", relay.get)
+    conn = db.connect(tmp_path / "t.db")
+    _entered(conn)
+    c = cfg()
+    c.gmail_relay_url = "https://x/exec?key=k"
     c.unknown_senders = "ignore"
-    assert len(inbox.check(c, conn)) == 2
+    assert [h["id"] for h in inbox.check(c, conn)] == ["a"]
+
+
+def test_inbox_relay_keeps_wins_when_discord_fails(monkeypatch, tmp_path):
+    relay = FakeRelay([{"id": "a", "score": 3, "subject": "You've won!", "from": "x <a@b.com>", "spam": False}])
+    monkeypatch.setattr(inbox.requests, "get", relay.get)
+
+    def down(*a, **k):
+        raise RuntimeError("Discord is down")
+    monkeypatch.setattr(inbox.discord, "post", down)
+    conn = db.connect(tmp_path / "t.db")
+    c = cfg()
+    c.gmail_relay_url = "https://x/exec?key=k"
+    with pytest.raises(RuntimeError):
+        inbox.check(c, conn)
+    assert relay.wins == {}  # the script was told it's safe here
+
+    sent = []
+    monkeypatch.setattr(inbox.discord, "post", lambda url, content, embeds=None, silent=False: sent.append(embeds))
+    assert len(inbox.check(c, conn)) == 1  # retried on the next check
+    assert sent[0][0]["title"] == "You've won!"
+
+
+def test_inbox_relay_old_script_without_ids(monkeypatch, tmp_path):
+    """The previous script version sends no id or score and deletes wins itself."""
+    monkeypatch.setattr(inbox.discord, "post", lambda *a, **k: None)
+    wins = [{"subject": "You've won!", "from": "x <a@b.com>", "snippet": "", "link": "l", "spam": False}]
+
+    class Resp:
+        def raise_for_status(self): pass
+        def json(self): return {"wins": wins}
+    monkeypatch.setattr(inbox.requests, "get", lambda url, params=None, timeout=None: Resp())
+    conn = db.connect(tmp_path / "t.db")
+    c = cfg()
+    c.gmail_relay_url = "https://x/exec?key=k"
+    assert len(inbox.check(c, conn)) == 1
+    assert inbox.check(c, conn) == []
+
+
+def test_inbox_relay_warns_when_script_stops(monkeypatch, tmp_path):
+    sent = []
+    monkeypatch.setattr(inbox.discord, "post", lambda url, content, embeds=None, silent=False: sent.append(content))
+    relay = FakeRelay([], checked_at=(time.time() - 5 * 3600) * 1000)
+    monkeypatch.setattr(inbox.requests, "get", relay.get)
+    conn = db.connect(tmp_path / "t.db")
+    c = cfg()
+    c.gmail_relay_url = "https://x/exec?key=k"
+    inbox.check(c, conn)
+    inbox.check(c, conn)
+    assert len(sent) == 1 and "hasn't checked your Gmail for 5 hours" in sent[0]
+    relay.checked_at = time.time() * 1000
+    inbox.check(c, conn)
+    assert len(sent) == 2 and "checking your Gmail again" in sent[1]
 
 
 def test_entered_brands(tmp_path):
@@ -444,8 +540,8 @@ def test_stats_log_and_report(tmp_path, monkeypatch):
     comps = [{"node_id": str(i), "title": t} for i, t in enumerate(
         ["Win a $1,500 Holiday from Qantas", "Win a Toaster from Clipsal", "Win 1 of 5 $2k Prizes from Acme"])]
     for c in comps:
-        conn.execute("INSERT INTO comps (node_id, title, node_url, first_seen) VALUES (?, ?, 'u', 'x')",
-                     (c["node_id"], c["title"]))
+        conn.execute("INSERT INTO comps (node_id, title, node_url, first_seen, categories) VALUES (?, ?, 'u', 'x', ?)",
+                     (c["node_id"], c["title"], "Lucky Draw, Email Subscription" if c["node_id"] != "2" else "Skill"))
     clock = iter([0, 300, 300, 400, 400, 99999])
     monkeypatch.setattr(entry.time, "monotonic", lambda: next(clock))
     entry._record(conn, comps[0], "e", started=entry.time.monotonic())  # 5 min
@@ -462,6 +558,9 @@ def test_stats_log_and_report(tmp_path, monkeypatch):
     text = stats.report(conn)
     assert "Comps entered:  2   (and 1 skipped)" in text and "Wins:           1   worth $1,500" in text
     assert "$4,154 an hour" in text and "above" in text
+    assert "Prizes entered: $3,500 in total" in text
+    assert "Lucky Draw" in text and "1 entered, about 5m 0s each, 1 skipped, 1 win ($1,500)" in text
+    assert "Skill" in text and "about 15m 0s each" in text
     stats.add_outside_win(conn, "Movie tickets", 40)
     assert stats.summary(conn)["entered"] == 2 and stats.summary(conn)["wins"] == 2
 
@@ -510,3 +609,186 @@ def test_gleam_comps_hidden(tmp_path):
                      "VALUES (?, 't', 'u', 'x', 'new', ?, '2099-01-01')", (node, cats))
     assert [r["node_id"] for r in entry.pending(conn)] == ["1"]
     assert sorted(r["node_id"] for r in entry.pending(conn, skip_gleam=False)) == ["1", "2"]
+
+
+DOB_FORM = """<!doctype html><html><body><form>
+  <div class="a"><label>Date of birth</label>
+    <select name="dob_day"><option value="">Day</option>""" + "".join(f"<option>{i}</option>" for i in range(1, 32)) + """</select>
+    <select name="dob_month"><option value="">Month</option>""" + "".join(
+        f"<option value='{i}'>{n}</option>" for i, n in enumerate(
+            ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+             "November", "December"], 1)) + """</select>
+    <select name="dob_year"><option value="">Year</option>""" + "".join(f"<option>{y}</option>" for y in range(2008, 1930, -1)) + """</select>
+  </div>
+  <div class="b"><span>Birthday</span>
+    <input name="bd" placeholder="DD" maxlength="2"><input name="bm" placeholder="MM" maxlength="2"><input name="by" placeholder="YYYY" maxlength="4">
+  </div>
+  <div class="c"><label>Your date of birth <input name="dob_text" placeholder="dd-mm-yyyy"></label></div>
+  <div class="d"><label>Date of birth <input name="dob_plain"></label></div>
+</form></body></html>"""
+
+
+def test_prefill_split_date_of_birth(tmp_path):
+    pw_api = pytest.importorskip("playwright.sync_api")
+    from compbot.entry import prefill_all_frames
+
+    (tmp_path / "dob.html").write_text(DOB_FORM)
+    with pw_api.sync_playwright() as pw:
+        exe = "/opt/pw-browsers/chromium" if Path("/opt/pw-browsers/chromium").exists() else None
+        try:
+            browser = pw.chromium.launch(executable_path=exe) if exe else pw.chromium.launch()
+        except Exception as e:
+            pytest.skip(f"no browser: {e}")
+        page = browser.new_page()
+        page.goto((tmp_path / "dob.html").as_uri())
+        prefill_all_frames(page, {"date_of_birth": "1995-03-04"})
+        v = lambda sel: page.eval_on_selector(sel, "e => e.value")
+        assert (v("[name=dob_day]"), v("[name=dob_month]"), v("[name=dob_year]")) == ("4", "3", "1995")
+        assert (v("[name=bd]"), v("[name=bm]"), v("[name=by]")) == ("04", "03", "1995")
+        assert v("[name=dob_text]") == "04-03-1995"
+        assert v("[name=dob_plain]") == "04/03/1995"
+        browser.close()
+
+
+def test_queue_order_closing_soon_then_value(tmp_path):
+    from datetime import timedelta
+    from compbot import entry
+    conn = db.connect(tmp_path / "q.db")
+    soon = (date.today() + timedelta(days=1)).isoformat()
+    later = (date.today() + timedelta(days=20)).isoformat()
+    for node, title, closing in (("1", "Win a Toaster", later), ("2", "Win a $5,000 Holiday", later),
+                                 ("3", "Win a $50 Voucher", soon), ("4", "Win $200 Cash", later)):
+        conn.execute("INSERT INTO comps (node_id, title, node_url, go_url, first_seen, closing) VALUES (?, ?, 'u', 'g', 'x', ?)",
+                     (node, title, closing))
+    conn.commit()
+    assert [r["node_id"] for r in entry.pending(conn)] == ["3", "2", "4", "1"]
+    assert "Prize: about $5,000" in entry.describe(entry.pending(conn)[1])
+
+
+def test_background_status(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from compbot import entry
+    monkeypatch.setattr(entry.os, "name", "posix")
+    conn = db.connect(tmp_path / "b.db")
+    assert "wasn't running" in entry.background_status(conn)
+    now = datetime.now(timezone.utc)
+    db.set_state(conn, "heartbeat", now.isoformat())
+    db.set_state(conn, "last_feed_ok", (now - timedelta(minutes=12)).isoformat())
+    assert entry.background_status(conn) == "OzBargain last checked 12 min ago."
+    db.set_state(conn, "heartbeat", (now - timedelta(hours=1)).isoformat())
+    assert "wasn't running" in entry.background_status(conn)
+
+
+def test_extension_prefill_in_sync():
+    from compbot import entry
+    assert (entry.EXTENSION_DIR / "prefill.js").read_text(encoding="utf-8") == entry.extension_prefill_js()
+
+
+def test_helper_rejects_web_pages():
+    import http.client
+    import json as _json
+    from compbot import helper
+    session = helper.Session([{"node_id": "1", "title": "Win $5", "go_url": "https://example.com/c", "categories": "",
+                               "closing": "", "status": "new"}], {"first_name": "Lou"})
+    server = helper.start(session)
+    if server is None:
+        pytest.skip("helper port busy")
+
+    def get(path, headers=None):
+        h = http.client.HTTPConnection("127.0.0.1", helper.PORT, timeout=5)
+        h.request("GET", path, headers=headers or {})
+        r = h.getresponse()
+        return r.status, r.getheader("Location"), r.read()
+    try:
+        assert get("/api/current")[0] == 403  # no header: a web page can't read your details
+        assert get("/api/current", {"X-Compbot": "1", "Origin": "https://evil.example"})[0] == 403
+        status, _, body = get("/api/current", {"X-Compbot": "1"})
+        assert status == 200 and _json.loads(body)["title"] == "Win $5"
+        assert get("/go?direct=1")[:2] == (302, "https://example.com/c")
+        assert b"https://example.com/c" in get("/go")[2]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+EXT_FORM = """<!doctype html><title>Comp {n}</title><form>
+<label>First name <input name="first_name"></label><label>Email <input type="email" name="email"></label>
+<button type="button">Enter</button></form>"""
+
+
+def test_extension_end_to_end(tmp_path, monkeypatch):
+    """Loads the real extension in Chromium: fill, Entered, Skip, then the all-done page."""
+    import http.server
+    import os
+    import queue as _queue
+    import threading
+    pw_api = pytest.importorskip("playwright.sync_api")
+    from compbot import entry, helper
+
+    site = tmp_path / "site"
+    site.mkdir()
+    for n in (1, 2):  # go_url must look like OzBargain's /goto/ links
+        (site / "goto" / str(n)).mkdir(parents=True)
+        (site / "goto" / str(n) / "index.html").write_text(EXT_FORM.format(n=n))
+    handler = lambda *a, **k: http.server.SimpleHTTPRequestHandler(*a, directory=str(site), **k)
+    handler.log_message = lambda *a: None
+    web = http.server.ThreadingHTTPServer(("127.0.0.2", 0), handler)
+    threading.Thread(target=web.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.2:{web.server_address[1]}"
+
+    conn_path = tmp_path / "e.db"
+    conn = db.connect(conn_path)
+    for node, title in (("1", "Win a $900 Bike from Acme"), ("2", "Win a Hat")):
+        conn.execute("INSERT INTO comps (node_id, title, node_url, go_url, first_seen, closing) VALUES (?, ?, 'u', ?, 'x', '2099-01-01')",
+                     (node, title, f"{base}/goto/{node}/"))
+    conn.commit()
+    conn.close()
+
+    opened = _queue.Queue()
+    monkeypatch.setattr(entry, "open_url", lambda cfg, url: opened.put(url))
+    c = cfg()
+    c.me = {"first_name": "Lou", "email": "lou@example.com"}
+    c.close_tabs = False
+    r_fd, w_fd = os.pipe()  # a terminal nobody types in
+
+    def run():
+        conn2 = db.connect(conn_path)
+        entry.run_normal(c, conn2, entry.pending(conn2), keys=os.fdopen(r_fd))
+    worker = threading.Thread(target=run, daemon=True)
+
+    exe = "/opt/pw-browsers/chromium" if Path("/opt/pw-browsers/chromium").exists() else None
+    with pw_api.sync_playwright() as pw:
+        try:
+            ctx = pw.chromium.launch_persistent_context(
+                str(tmp_path / "profile"), executable_path=exe, headless=True,
+                args=["--proxy-server=direct://", f"--disable-extensions-except={entry.EXTENSION_DIR}",
+                      f"--load-extension={entry.EXTENSION_DIR}"])
+        except Exception as e:
+            pytest.skip(f"no browser: {e}")
+        try:
+            if not ctx.service_workers:
+                ctx.wait_for_event("serviceworker", timeout=10000)
+            worker.start()
+            page = ctx.new_page()
+            page.goto(opened.get(timeout=10))
+            bar = page.locator("text=Comp 1 of 2")
+            bar.wait_for(timeout=10000)
+            assert page.locator("text=about $900").count() == 1
+            page.get_by_role("button", name="Fill my details").click()
+            page.wait_for_function("document.querySelector('[name=email]').value === 'lou@example.com'", timeout=5000)
+            assert page.eval_on_selector("[name=first_name]", "e => e.value") == "Lou"
+            page.get_by_role("button", name="Entered").click()
+            page.locator("text=Comp 2 of 2").wait_for(timeout=10000)
+            assert page.url.endswith("/goto/2/")
+            os.write(w_fd, b"s\n")  # pressed in the terminal instead: the tab catches up by itself
+            page.locator("text=All done").wait_for(timeout=10000)
+            assert "1 entered" in page.inner_text("#summary")
+            worker.join(10)
+            assert not worker.is_alive()
+        finally:
+            ctx.close()
+            web.shutdown()
+    conn = db.connect(conn_path)
+    rows = dict(conn.execute("SELECT node_id, status FROM comps").fetchall())
+    assert rows == {"1": "entered", "2": "skipped"}
+    assert conn.execute("SELECT entry_domain FROM comps WHERE node_id = '1'").fetchone()[0] == "127.0.0.2"

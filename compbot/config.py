@@ -43,7 +43,7 @@ def load(path: Path = CONFIG_PATH) -> Config:
         with open(path, "rb") as f:
             raw = tomllib.load(f)
     elif os.environ.get("COMPBOT_DISCORD_WEBHOOK"):
-        raw = {}  # running on GitHub Actions: settings come from repository secrets
+        raw = {}  # settings come from COMPBOT_* environment variables
     else:
         raise SystemExit(
             f"Missing {path.name}. Copy config.example.toml to config.toml and fill it in."

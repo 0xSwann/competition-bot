@@ -1,7 +1,10 @@
 """Watches a Gmail inbox over IMAP for emails that look like competition wins."""
 import email
+import hashlib
 import imaplib
+import json
 import re
+import time
 from datetime import date, timedelta
 from email.header import decode_header, make_header
 from email.utils import parseaddr
@@ -89,8 +92,9 @@ def _body_text(msg) -> str:
 
 
 def known_promoter_domains(conn) -> set:
+    """Websites you entered comps on. entry_domain can hold several hosts (the page and any form inside it)."""
     rows = conn.execute("SELECT entry_domain FROM comps WHERE status = 'entered' AND entry_domain IS NOT NULL")
-    return {base_domain(r["entry_domain"]) for r in rows if r["entry_domain"]}
+    return {base_domain(h) for r in rows for h in (r["entry_domain"] or "").split() if "." in h}
 
 
 def _squash(text: str) -> str:
@@ -123,11 +127,22 @@ def is_known_sender(conn, sender: str) -> bool:
     return any(b in squashed for b in entered_brands(conn))
 
 
+KNOWN_SENDER_POINTS = 2
+RELAY_STALE_HOURS = 2
+
+
 def alert(cfg, conn, h: dict) -> bool:
-    """Posts a possible win. Returns False when it was dropped as probable spam."""
+    """Posts a possible win. Returns False when it isn't worth posting.
+
+    h["score"] is the email's win score without the points for brands you entered with; emails found by
+    an older Gmail watcher have no score and were already judged to be possible wins.
+    """
     known = is_known_sender(conn, h["sender"])
+    points = h.get("score", 3) + (KNOWN_SENDER_POINTS if known else 0)
+    if points < 3:
+        return False
     mode = cfg.unknown_senders
-    if not known and (mode == "ignore" or (h.get("spam") and mode != "alert")):
+    if not known and mode == "ignore":
         return False
     loud = known or mode == "alert"
     fields = [{"name": "From", "value": h["sender"][:256] or "?"}]
@@ -140,7 +155,10 @@ def alert(cfg, conn, h: dict) -> bool:
         if known else
         "🏆 **Possible competition win!** Check your email; claim deadlines can be short."
         if loud else
-        "❔ Win-like email from a sender you haven't entered a comp with. Probably spam, but have a look if it seems real.",
+        ("❔ Win-like email in your **spam folder** from a sender you haven't entered a comp with. "
+         "Real winner emails sometimes land there, so have a look if it seems real."
+         if h.get("spam") else
+         "❔ Win-like email from a sender you haven't entered a comp with. Probably spam, but have a look if it seems real."),
         [{
             "title": h["subject"][:256] or "(no subject)",
             "url": h.get("link") or None,
@@ -153,16 +171,67 @@ def alert(cfg, conn, h: dict) -> bool:
     return True
 
 
+def queue(conn, hits: list[dict]) -> None:
+    """Saves possible wins before anything is posted, so a failed Discord post can be retried next check."""
+    for h in hits:
+        key = h.get("id") or hashlib.sha1(
+            "|".join(str(h.get(k, "")) for k in ("subject", "sender", "link")).encode()).hexdigest()
+        conn.execute("INSERT OR IGNORE INTO alerts (id, data, received_at) VALUES (?, ?, ?)",
+                     (key, json.dumps(h), db.now()))
+    conn.commit()
+
+
+def flush(cfg, conn) -> list[dict]:
+    """Posts saved possible wins that haven't been handled yet. A Discord error stops here and is retried later."""
+    posted = []
+    for row in conn.execute("SELECT id, data FROM alerts WHERE posted_at IS NULL ORDER BY received_at").fetchall():
+        h = json.loads(row["data"])
+        if alert(cfg, conn, h):
+            posted.append(h)
+        conn.execute("UPDATE alerts SET posted_at = ? WHERE id = ?", (db.now(), row["id"]))
+        conn.commit()
+    return posted
+
+
+def _warn_if_stale(cfg, conn, checked_at_ms) -> None:
+    """Tells you once if the Google script has stopped checking Gmail (e.g. Google turned off its timer)."""
+    if not checked_at_ms:
+        return
+    hours = (time.time() - checked_at_ms / 1000) / 3600
+    warned = db.get_state(conn, "relay_stale_warned")
+    if hours >= RELAY_STALE_HOURS and not warned:
+        discord.post(
+            cfg.discord_webhook,
+            f"⚠️ The Google script hasn't checked your Gmail for {hours:.0f} hours, so win emails aren't being spotted. "
+            "Open the script at script.google.com, run **setup** again and approve anything Google asks for.",
+        )
+        db.set_state(conn, "relay_stale_warned", db.now())
+    elif hours < RELAY_STALE_HOURS and warned:
+        conn.execute("DELETE FROM state WHERE key = 'relay_stale_warned'")
+        conn.commit()
+        discord.post(cfg.discord_webhook, "✅ The Google script is checking your Gmail again.", silent=True)
+
+
 def check_relay(cfg, conn) -> list[dict]:
-    """Collects possible wins found by the Google Apps Script watcher (see phone/Code.gs, PC_MODE)."""
+    """Collects possible wins found by the Google Apps Script watcher (phone/Code.gs) and posts them."""
     r = requests.get(cfg.gmail_relay_url, timeout=60)
     r.raise_for_status()
     data = r.json()
     if "error" in data:
         raise RuntimeError(f"Gmail watcher said: {data['error']}. Check relay_url in config.toml.")
-    hits = [{"subject": w.get("subject", ""), "sender": w.get("from", ""), "snippet": w.get("snippet", ""),
-             "link": w.get("link", ""), "spam": bool(w.get("spam"))} for w in data.get("wins", [])]
-    return [h for h in hits if alert(cfg, conn, h)]
+    hits = []
+    for w in data.get("wins", []):
+        h = {"id": w.get("id"), "subject": w.get("subject", ""), "sender": w.get("from", ""),
+             "snippet": w.get("snippet", ""), "link": w.get("link", ""), "spam": bool(w.get("spam"))}
+        if "score" in w:
+            h["score"] = int(w["score"])
+        hits.append(h)
+    queue(conn, hits)
+    ids = [h["id"] for h in hits if h["id"]]
+    if ids:  # saved here now, so the script can forget them
+        requests.get(cfg.gmail_relay_url, params={"ack": ",".join(ids)}, timeout=60).raise_for_status()
+    _warn_if_stale(cfg, conn, data.get("checkedAt"))
+    return flush(cfg, conn)
 
 
 def check(cfg, conn) -> list[dict]:
@@ -184,14 +253,13 @@ def check(cfg, conn) -> list[dict]:
         except Exception:
             pass
 
-    posted = []
     for h in hits:
         h["link"] = (f"https://mail.google.com/mail/u/{cfg.gmail_address}/#search/rfc822msgid%3A{quote(h['message_id'])}"
                      if h["message_id"] else "")
-        h["spam"] = "Spam" in h["folder"]
-        if alert(cfg, conn, h):
-            posted.append(h)
-    return posted
+        h["spam"] = "Spam" in h.pop("folder")
+        h["id"] = h["message_id"] or None
+    queue(conn, hits)
+    return flush(cfg, conn)
 
 
 def _check_folder(imap, folder, cfg, conn, known) -> list[dict]:
@@ -237,6 +305,7 @@ def _check_folder(imap, folder, cfg, conn, known) -> list[dict]:
                 "subject": subject, "sender": sender, "folder": folder,
                 "message_id": (msg.get("Message-ID") or "").strip("<> "),
                 "snippet": body[:300],
+                "score": 3,  # already judged a possible win, including the points for brands you entered with
             })
     if uids:
         db.set_state(conn, state_key, f"{validity}:{max(uids)}")

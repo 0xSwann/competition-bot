@@ -1,10 +1,12 @@
 """Entry helper: opens each new comp in a browser, pre-fills your details, and you submit."""
 import json
 import os
+import queue
 import subprocess
+import threading
 import time
 import webbrowser
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
@@ -32,17 +34,41 @@ def _entered_before_today(row, today) -> bool:
         return True
 
 
-def pending(conn, skip_gleam: bool = True) -> list:
-    """New comps, plus daily-entry comps you entered on an earlier day, soonest closing first.
+CLOSING_SOON_DAYS = 2
 
-    With skip_gleam, Gleam comps already waiting (seen before Gleam was filtered) are left out too."""
+
+def queue_order(row, today=None):
+    """Comps closing in the next couple of days first, then the biggest prizes, then the rest by closing date."""
+    today = today or date.today()
+    closes = _closing_date(row["closing"])
+    soon = closes is not None and (closes - today).days <= CLOSING_SOON_DAYS
+    value = stats.prize_hint(row["title"]) or 0
+    return (0 if soon else 1, row["closing"] or "9999" if soon else "", -value, row["closing"] or "9999")
+
+
+def pending(conn, skip_gleam: bool = True) -> list:
+    """New comps, plus daily-entry comps you entered on an earlier day.
+
+    Comps closing within two days come first, then the rest from the biggest prize down, so a short session
+    covers the best ones. With skip_gleam, Gleam comps already waiting (seen before Gleam was filtered) are left out."""
     today = date.today()
     rows = conn.execute("SELECT * FROM comps WHERE status = 'new' OR (status = 'entered' AND daily = 1)").fetchall()
     rows = [r for r in rows if r["status"] == "new" or _entered_before_today(r, today)]
     open_rows = [r for r in rows if not (_closing_date(r["closing"]) and _closing_date(r["closing"]) < today)]
     if skip_gleam:
         open_rows = [r for r in open_rows if not is_gleam(r)]
-    return sorted(open_rows, key=lambda r: r["closing"] or "9999")
+    return sorted(open_rows, key=lambda r: queue_order(r, today))
+
+
+def describe(comp) -> str:
+    """The lines shown for each comp in Enter comps."""
+    value = stats.prize_hint(comp["title"])
+    lines = [f"  Prize: about ${value:,.0f}   " if value else "  ",
+             f"Entry: {comp['categories'] or 'unknown'}   Closes: {(comp['closing'] or 'unknown')[:10]}"]
+    out = "".join(lines)
+    if comp["status"] == "entered":
+        out += "\n  Daily entry: you entered this on an earlier day, so it's back for today's entry."
+    return out + f"\n  OzBargain: {comp['node_url']}"
 
 
 def prefill_all_frames(page, me: dict) -> list[str]:
@@ -213,48 +239,107 @@ def _record(conn, comp, choice, host="", started=None):
     conn.commit()
 
 
-def run_normal(cfg, conn, todo) -> None:
+def _read_keys(session, keys=None) -> None:
+    """Passes what you type in the terminal to the main loop, alongside the extension's buttons."""
+    import sys
+    for line in keys or sys.stdin:
+        session.actions.put(("terminal", line.strip().lower()[:1], [], None))
+    session.actions.put(("terminal", "q", [], None))  # the window was closed
+
+
+EXTENSION_DIR = Path(__file__).resolve().parent.parent / "extension"
+
+
+def extension_prefill_js() -> str:
+    return ("// Generated from compbot/prefill.js when Enter comps starts. Edit that file, not this one.\n"
+            "self.compbotPrefill = " + PREFILL_JS.rstrip() + ";\n")
+
+
+def sync_extension() -> None:
+    """Keeps the extension's copy of the form filler the same as compbot/prefill.js."""
+    target = EXTENSION_DIR / "prefill.js"
+    try:
+        if target.parent.exists() and (not target.exists() or target.read_text(encoding="utf-8") != extension_prefill_js()):
+            target.write_text(extension_prefill_js(), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def run_normal(cfg, conn, todo, keys=None) -> None:
+    """Opens each comp in your own Chrome. The Competition bot extension fills the form and puts
+    Entered / Skip / Later buttons on the page; the keys here work too."""
+    from . import helper
+
+    sync_extension()
+
+    session = helper.Session(todo, cfg.me)
+    if helper.start(session) is None:
+        print("Enter comps already seems to be open in another window. Use that one, or close it and try again.")
+        return
     session_start = db.now()
-    if not BOOKMARK_PAGE.exists():
-        open_url(cfg, write_bookmark_page(cfg.me).as_uri())
-        print("First time: a page opened in your browser. Drag its \"Fill my details\" button onto your\n"
-              "bookmarks bar, then come back here and press Enter.")
-        input()
-    print(f"{len(todo)} comp(s) to go, soonest closing first.\n"
-          "Each one opens in your browser. Click \"Fill my details\" on the entry form, check it, do any\n"
-          "CAPTCHA or written answer, tick the boxes you agree to, then submit it yourself.")
-    prompt = ("\n  [e] I entered it   [s] skip for good   [l] later   [o] open it again   [q] quit\n"
-              "  (e and s also close the comp's tab, so stay on it until you press them)\n  > "
-              if cfg.close_tabs else
-              "\n  [e] I entered it   [s] skip for good   [l] later   [o] open it again   [q] quit\n  > ")
-    for i, comp in enumerate(todo, 1):
-        print(f"\n[{i}/{len(todo)}] {comp['title']}")
-        print(f"  Entry: {comp['categories'] or 'unknown'}   Closes: {comp['closing'] or 'unknown'}")
-        if comp["status"] == "entered":
-            print("  Daily entry: you entered this on an earlier day, so it's back for today's entry.")
-        print(f"  OzBargain: {comp['node_url']}")
+    print(f"{len(todo)} comp(s) to go: closing soon first, then biggest prizes.\n"
+          "Each one opens in Chrome. Fill in your details (the extension's Fill button, Alt+Shift+F), check them,\n"
+          "do any CAPTCHA or written answer, tick the boxes you agree to, and submit it yourself. Then press\n"
+          "Entered, Skip or Later on the page (or Alt+Shift+E / S / L), or type e, s, l here.")
+    prompt = "\n  [e] entered   [s] skip for good   [l] later   [o] open it again   [q] quit\n  > "
+    threading.Thread(target=_read_keys, args=(session, keys), daemon=True).start()
+    hinted = False
+
+    while session.comp is not None:
+        comp = session.comp
+        print(f"\n[{session.i + 1}/{len(session.todo)}] {comp['title']}")
+        print(describe(comp))
         started = time.monotonic()
-        open_url(cfg, comp["go_url"])
+        if not session.extension_active():
+            open_url(cfg, helper.BASE + "/go")  # the extension takes over this tab and moves it along from here
+        print(prompt, end="", flush=True)
         while True:
-            choice = input(prompt).strip().lower()[:1]
-            if choice == "o":
-                open_url(cfg, comp["go_url"])
+            try:
+                source, choice, hosts, done = session.actions.get(timeout=12)
+            except queue.Empty:
+                if not hinted and not session.extension_active(60):
+                    hinted = True
+                    print("\n  (The Chrome extension isn't connected. See \"Chrome extension\" in README.md to add it,"
+                          "\n   or use the Fill my details bookmark and the keys here.)" + prompt, end="", flush=True)
                 continue
-            if choice in ("e", "s", "l", "q"):
+            if choice == "o":
+                open_url(cfg, helper.BASE + "/go")
+                print(prompt, end="", flush=True)
+                continue
+            if choice in ACTIONS:
                 break
-        _record(conn, comp, choice, started=started)
+            if source == "terminal":
+                print(prompt, end="", flush=True)
+        _record(conn, comp, choice, host=" ".join(hosts), started=started)
+        if source == "extension":
+            print({"e": "entered", "s": "skipped", "l": "later", "q": "quit"}[choice] + " (from Chrome)")
+        elif choice in ("e", "s") and cfg.close_tabs and not session.extension_active():
+            if not close_active_chrome_tab():
+                print("  (Couldn't close the tab automatically; close it yourself.)")
         if choice == "q":
+            session.finish(_session_line(conn, session_start))
+            if done:
+                done.set()
             break
-        if choice in ("e", "s") and cfg.close_tabs and not close_active_chrome_tab():
-            print("  (Couldn't close the tab automatically; close it yourself.)")
+        session.advance()
+        if session.comp is None:
+            session.finish(_session_line(conn, session_start))
+        if done:
+            done.set()
+    if session.comp is None and not session.summary:
+        session.finish(_session_line(conn, session_start))
     _goodbye(conn, session_start)
 
 
-def _goodbye(conn, session_start: str) -> None:
+def _session_line(conn, session_start: str) -> str:
     row = conn.execute(
         "SELECT SUM(action = 'entered'), COALESCE(SUM(seconds), 0) FROM entries WHERE at >= ?", (session_start,)
     ).fetchone()
-    print(f"\nDone. This session: {row[0] or 0} entered in {stats._duration(row[1])}.")
+    return f"This session: {row[0] or 0} entered in {stats._duration(row[1])}."
+
+
+def _goodbye(conn, session_start: str) -> None:
+    print(f"\nDone. {_session_line(conn, session_start)}")
     print(f"All time: {stats.summary(conn)['entered']} entered. Double-click Comp stats for the full picture.")
 
 
@@ -270,7 +355,37 @@ def launch(pw, channel: str):
     raise SystemExit(f"Couldn't start a browser: {last}")
 
 
+TASK_NAME = "Competition bot"
+
+
+def _ago(iso):
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(iso)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
+def background_status(conn) -> str:
+    """One line on the background task: when it last checked OzBargain, or a warning if it isn't running."""
+    beat = _ago(db.get_state(conn, "heartbeat"))
+    feed_ok = _ago(db.get_state(conn, "last_feed_ok"))
+    if beat is None or beat > 15 * 60:
+        started = False
+        if os.name == "nt":
+            started = subprocess.run(["schtasks", "/Run", "/TN", TASK_NAME], capture_output=True).returncode == 0
+        return ("Heads up: the background task wasn't running, so new comps and win emails weren't being checked. "
+                + ("It's started again now." if started else
+                   "Run setup.bat to start it again (or restart your PC)."))
+    if feed_ok is None:
+        return "The background task is running."
+    mins = int(feed_ok // 60)
+    when = "just now" if mins < 1 else f"{mins} min ago" if mins < 120 else f"{mins // 60} hours ago"
+    warn = "  (that's a while: see data\\compbot.log)" if mins >= 120 else ""
+    return f"OzBargain last checked {when}.{warn}"
+
+
 def run(cfg, conn) -> None:
+    print(background_status(conn))
     todo = pending(conn, cfg.exclude_gleam)
     if not todo:
         print("No comps waiting. You're all caught up.")
@@ -279,7 +394,7 @@ def run(cfg, conn) -> None:
         run_normal(cfg, conn, todo)
         return
     session_start = db.now()
-    print(f"{len(todo)} comp(s) to go, soonest closing first.\n"
+    print(f"{len(todo)} comp(s) to go: closing soon first, then biggest prizes.\n"
           "The browser fills in your details. Check them, do any CAPTCHA or written answer, "
           "tick the boxes you agree to, then press the site's submit button yourself.")
 
@@ -290,10 +405,7 @@ def run(cfg, conn) -> None:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         for i, comp in enumerate(todo, 1):
             print(f"\n[{i}/{len(todo)}] {comp['title']}")
-            print(f"  Entry: {comp['categories'] or 'unknown'}   Closes: {comp['closing'] or 'unknown'}")
-            if comp["status"] == "entered":
-                print("  Daily entry: you entered this on an earlier day, so it's back for today's entry.")
-            print(f"  OzBargain: {comp['node_url']}")
+            print(describe(comp))
             started = time.monotonic()
             if uses_gleam(comp):
                 open_url(cfg, comp["go_url"])
