@@ -608,7 +608,31 @@ def test_gleam_comps_hidden(tmp_path):
         conn.execute("INSERT INTO comps (node_id, title, node_url, first_seen, status, categories, closing) "
                      "VALUES (?, 't', 'u', 'x', 'new', ?, '2099-01-01')", (node, cats))
     assert [r["node_id"] for r in entry.pending(conn)] == ["1"]
-    assert sorted(r["node_id"] for r in entry.pending(conn, skip_gleam=False)) == ["1", "2"]
+    c.exclude_gleam = False
+    assert sorted(r["node_id"] for r in entry.pending(conn, c)) == ["1", "2"]
+
+
+def test_instagram_comps_hidden(tmp_path):
+    from compbot import entry
+    c = cfg()
+    base = {"title": "Win a TV", "text": "Enter on the brand's site", "categories": "Website", "closing": "2099-01-01",
+            "go_url": "https://www.ozbargain.com.au/goto/1", "node_url": "https://www.ozbargain.com.au/competition/1"}
+    assert feed.is_wanted(base, c)
+    assert not feed.is_wanted({**base, "categories": "Instagram, Like/Follow/Comment/Share"}, c)
+    assert not feed.is_wanted({**base, "title": "Win a TV (Instagram)"}, c)
+    assert not feed.is_wanted({**base, "text": "Follow @brand and comment on the IG post"}, c)
+    assert not feed.is_wanted({**base, "text": "See https://www.instagram.com/p/abc/"}, c)
+    assert not feed.is_wanted({**base, "title": "Win Skincare via Insta"}, c)
+    assert feed.is_wanted({**base, "title": "Win an Insta360 Camera"}, c)
+    c.exclude_instagram = False
+    assert feed.is_wanted({**base, "categories": "Instagram"}, c)
+
+    conn = db.connect(tmp_path / "t.db")
+    for node, title in [("1", "Win a TV"), ("2", "Win a Bag (Instagram)")]:
+        conn.execute("INSERT INTO comps (node_id, title, node_url, first_seen, status, categories, closing) "
+                     "VALUES (?, ?, 'u', 'x', 'new', 'Website', '2099-01-01')", (node, title))
+    assert [r["node_id"] for r in entry.pending(conn)] == ["1"]
+    assert sorted(r["node_id"] for r in entry.pending(conn, c)) == ["1", "2"]
 
 
 DOB_FORM = """<!doctype html><html><body><form>

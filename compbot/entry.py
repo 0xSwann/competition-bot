@@ -12,7 +12,7 @@ from urllib.parse import quote, urlparse
 
 from . import db, stats
 from .config import DATA_DIR
-from .feed import _closing_date, is_gleam
+from .feed import _closing_date, is_gleam, is_hidden_platform
 
 PREFILL_JS = (Path(__file__).parent / "prefill.js").read_text(encoding="utf-8")
 
@@ -46,17 +46,17 @@ def queue_order(row, today=None):
     return (0 if soon else 1, row["closing"] or "9999" if soon else "", -value, row["closing"] or "9999")
 
 
-def pending(conn, skip_gleam: bool = True) -> list:
+def pending(conn, cfg=None) -> list:
     """New comps, plus daily-entry comps you entered on an earlier day.
 
     Comps closing within two days come first, then the rest from the biggest prize down, so a short session
-    covers the best ones. With skip_gleam, Gleam comps already waiting (seen before Gleam was filtered) are left out."""
+    covers the best ones. Gleam and Instagram comps already waiting (seen before they were filtered) are left out too,
+    unless config.toml shows them."""
     today = date.today()
     rows = conn.execute("SELECT * FROM comps WHERE status = 'new' OR (status = 'entered' AND daily = 1)").fetchall()
     rows = [r for r in rows if r["status"] == "new" or _entered_before_today(r, today)]
     open_rows = [r for r in rows if not (_closing_date(r["closing"]) and _closing_date(r["closing"]) < today)]
-    if skip_gleam:
-        open_rows = [r for r in open_rows if not is_gleam(r)]
+    open_rows = [r for r in open_rows if not is_hidden_platform(r, cfg)]
     return sorted(open_rows, key=lambda r: queue_order(r, today))
 
 
@@ -396,7 +396,7 @@ def background_status(conn) -> str:
 
 def run(cfg, conn) -> None:
     print(background_status(conn))
-    todo = pending(conn, cfg.exclude_gleam)
+    todo = pending(conn, cfg)
     if not todo:
         print("No comps waiting. You're all caught up.")
         return
