@@ -5,13 +5,12 @@
 webhook_url = ""
 
 [gmail]
-address = ""         # the Gmail account to watch
-# Google Account > Security > 2-Step Verification (must be on) > App passwords.
-# Create one called "compbot" and paste the 16 characters here.
-app_password = ""
-# Or, if app passwords aren't available: set up the Google script (phone/Code.gs with PC_MODE = true),
-# run showLink in it, and paste the line it prints here. Leave app_password blank in that case.
+# Win emails are spotted by the Google script (phone/Code.gs) running in the Gmail account you use for comps.
+# Set it up, run showLink in it, and paste the line it prints here.
 relay_url = ""
+# Only if you'd rather the PC read Gmail itself: the address and a Gmail app password (leave relay_url blank).
+address = ""
+app_password = ""
 
 [me]
 # Used to pre-fill entry forms. Leave anything blank that you don't want filled.
@@ -46,13 +45,14 @@ check_every_minutes = 10
 first_run_lookback_days = 14
 
 [browser]
-# "normal": Enter comps opens each comp in your own browser, and the "Fill my details" bookmark fills the form.
+# "normal": Enter comps opens each comp in your own Chrome, where the Competition bot extension fills the form
+#           (see README.md). The "Fill my details" bookmark still works if you'd rather not use the extension.
 # "edge": Enter comps opens a separate Edge window that fills forms itself (Gleam comps still use your browser).
 mode = "normal"
 # In "normal" mode, open comps in this Chrome profile (the name shown in Chrome's profile menu).
 # Leave blank to use your default browser.
 chrome_profile = ""
-# Close the comp's Chrome tab when you press e or s in Enter comps.
+# Without the extension: close the comp's Chrome tab when you press e or s in Enter comps.
 close_tabs = true
 # "msedge" (built into Windows 11), "chrome", or "" to try Edge, then Chrome, then Playwright's Chromium.
 channel = "msedge"

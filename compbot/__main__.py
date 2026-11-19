@@ -12,9 +12,8 @@ def main() -> None:
     p = argparse.ArgumentParser(prog="compbot", description="OzBargain competition helper")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("run", help="watch the feed and inbox forever (what the scheduled task runs)")
-    sub.add_parser("once", help="check the feed and inbox once (what GitHub Actions runs)")
     sub.add_parser("feed", help="check the OzBargain feed once")
-    sub.add_parser("inbox", help="check the inbox once")
+    sub.add_parser("inbox", help="collect win emails from the Google script (or check Gmail) once")
     sub.add_parser("enter", help="open new comps one by one with your details pre-filled")
     sub.add_parser("bookmark", help="make the \"Fill my details\" bookmark page and open it")
     sub.add_parser("test-discord", help="send a test message to the Discord webhook")
@@ -26,16 +25,7 @@ def main() -> None:
     cfg = config.load()
     conn = db.connect()
 
-    if args.cmd == "once":
-        failed = False
-        for name, fn in (("feed", feed.check), ("inbox", inbox.check)):
-            try:
-                print(f"{name}: {len(fn(cfg, conn))} found")
-            except Exception:
-                failed = True
-                traceback.print_exc()
-        raise SystemExit(1 if failed else 0)
-    elif args.cmd == "feed":
+    if args.cmd == "feed":
         print(f"{len(feed.check(cfg, conn))} new comp(s) matched your filters.")
     elif args.cmd == "inbox":
         print(f"{len(inbox.check(cfg, conn))} possible win(s) found.")

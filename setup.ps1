@@ -34,7 +34,7 @@ Write-Host "Installing fallback browser..."
 if (-not (Test-Path "config.toml")) {
     Copy-Item "config.example.toml" "config.toml"
     Write-Host ""
-    Write-Host "Created config.toml. Fill it in (Discord webhook, Gmail app password, your details)," -ForegroundColor Yellow
+    Write-Host "Created config.toml. Fill it in (Discord webhook, the relay_url line from the Google script, your details)," -ForegroundColor Yellow
     Write-Host "then run setup.bat again to finish." -ForegroundColor Yellow
     Start-Process notepad.exe "config.toml"
     exit 0
@@ -52,7 +52,7 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
     -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5) -StartWhenAvailable
 Stop-ScheduledTask -TaskName "Competition bot" -ErrorAction SilentlyContinue
 Register-ScheduledTask -TaskName "Competition bot" -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
-    -Description "Watches OzBargain comps and your inbox, alerts Discord" -Force | Out-Null
+    -Description "Watches OzBargain comps and collects win emails, alerts Discord" -Force | Out-Null
 Start-ScheduledTask -TaskName "Competition bot"
 
 Write-Host "Creating 'Enter comps' and 'Comp stats' shortcuts on your desktop..."
@@ -70,3 +70,5 @@ Write-Host ""
 Write-Host "All set. The bot is running in the background and will post to Discord." -ForegroundColor Green
 Write-Host "Double-click 'Enter comps' on your desktop whenever you want to work through new comps."
 Write-Host "Double-click 'Comp stats' to see entries, time spent and wins, and to record a win."
+Write-Host "Last step: add the Chrome extension. See 'Chrome extension' in README.md (chrome://extensions, Load unpacked, the extension folder)."
+Write-Host "To update later, double-click update.bat."
