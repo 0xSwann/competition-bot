@@ -1,6 +1,7 @@
 import email.message
 import re
 import time
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -539,8 +540,8 @@ def test_stats_log_and_report(tmp_path, monkeypatch):
     comps = [{"node_id": str(i), "title": t} for i, t in enumerate(
         ["Win a $1,500 Holiday from Qantas", "Win a Toaster from Clipsal", "Win 1 of 5 $2k Prizes from Acme"])]
     for c in comps:
-        conn.execute("INSERT INTO comps (node_id, title, node_url, first_seen) VALUES (?, ?, 'u', 'x')",
-                     (c["node_id"], c["title"]))
+        conn.execute("INSERT INTO comps (node_id, title, node_url, first_seen, categories) VALUES (?, ?, 'u', 'x', ?)",
+                     (c["node_id"], c["title"], "Lucky Draw, Email Subscription" if c["node_id"] != "2" else "Skill"))
     clock = iter([0, 300, 300, 400, 400, 99999])
     monkeypatch.setattr(entry.time, "monotonic", lambda: next(clock))
     entry._record(conn, comps[0], "e", started=entry.time.monotonic())  # 5 min
@@ -557,6 +558,9 @@ def test_stats_log_and_report(tmp_path, monkeypatch):
     text = stats.report(conn)
     assert "Comps entered:  2   (and 1 skipped)" in text and "Wins:           1   worth $1,500" in text
     assert "$4,154 an hour" in text and "above" in text
+    assert "Prizes entered: $3,500 in total" in text
+    assert "Lucky Draw" in text and "1 entered, about 5m 0s each, 1 skipped, 1 win ($1,500)" in text
+    assert "Skill" in text and "about 15m 0s each" in text
     stats.add_outside_win(conn, "Movie tickets", 40)
     assert stats.summary(conn)["entered"] == 2 and stats.summary(conn)["wins"] == 2
 
@@ -644,3 +648,32 @@ def test_prefill_split_date_of_birth(tmp_path):
         assert v("[name=dob_text]") == "04-03-1995"
         assert v("[name=dob_plain]") == "04/03/1995"
         browser.close()
+
+
+def test_queue_order_closing_soon_then_value(tmp_path):
+    from datetime import timedelta
+    from compbot import entry
+    conn = db.connect(tmp_path / "q.db")
+    soon = (date.today() + timedelta(days=1)).isoformat()
+    later = (date.today() + timedelta(days=20)).isoformat()
+    for node, title, closing in (("1", "Win a Toaster", later), ("2", "Win a $5,000 Holiday", later),
+                                 ("3", "Win a $50 Voucher", soon), ("4", "Win $200 Cash", later)):
+        conn.execute("INSERT INTO comps (node_id, title, node_url, go_url, first_seen, closing) VALUES (?, ?, 'u', 'g', 'x', ?)",
+                     (node, title, closing))
+    conn.commit()
+    assert [r["node_id"] for r in entry.pending(conn)] == ["3", "2", "4", "1"]
+    assert "Prize: about $5,000" in entry.describe(entry.pending(conn)[1])
+
+
+def test_background_status(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from compbot import entry
+    monkeypatch.setattr(entry.os, "name", "posix")
+    conn = db.connect(tmp_path / "b.db")
+    assert "wasn't running" in entry.background_status(conn)
+    now = datetime.now(timezone.utc)
+    db.set_state(conn, "heartbeat", now.isoformat())
+    db.set_state(conn, "last_feed_ok", (now - timedelta(minutes=12)).isoformat())
+    assert entry.background_status(conn) == "OzBargain last checked 12 min ago."
+    db.set_state(conn, "heartbeat", (now - timedelta(hours=1)).isoformat())
+    assert "wasn't running" in entry.background_status(conn)

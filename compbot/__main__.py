@@ -1,6 +1,7 @@
 """Command line: python -m compbot <command>"""
 import argparse
 import logging
+import logging.handlers
 import time
 import traceback
 
@@ -60,16 +61,23 @@ def main() -> None:
         run_forever(cfg, conn)
 
 
+HEARTBEAT_SECONDS = 5 * 60
+
+
 def run_forever(cfg, conn) -> None:
-    logging.basicConfig(
-        filename=config.DATA_DIR / "compbot.log", level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    # Keeps at most about 3 MB of log: compbot.log plus two older files.
+    handler = logging.handlers.RotatingFileHandler(
+        config.DATA_DIR / "compbot.log", maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+    logging.basicConfig(handlers=[handler], level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     next_feed = next_inbox = 0.0
     failures = {"feed": 0, "inbox": 0}
     logging.info("started")
+    last_beat = 0.0
     while True:
         now = time.time()
+        if now - last_beat >= HEARTBEAT_SECONDS:  # lets Enter comps tell whether this task is running
+            db.set_state(conn, "heartbeat", db.now())
+            last_beat = now
         for name, due, minutes, fn in (
             ("feed", next_feed, cfg.feed_minutes, feed.check),
             ("inbox", next_inbox, cfg.inbox_minutes, inbox.check),
@@ -79,6 +87,7 @@ def run_forever(cfg, conn) -> None:
             try:
                 found = fn(cfg, conn)
                 logging.info("%s check ok: %d found", name, len(found))
+                db.set_state(conn, f"last_{name}_ok", db.now())
                 failures[name] = 0
             except Exception:
                 failures[name] += 1

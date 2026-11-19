@@ -79,7 +79,56 @@ def report(conn) -> str:
         rate = s["prize_total"] / hours
         verdict = "above" if rate >= GOAL_PER_HOUR else "below"
         lines.append(f"Return:         ${rate:,.0f} an hour   ({verdict} your ${GOAL_PER_HOUR}/hour mark)")
+        pool = prize_pool(conn)
+        if pool:
+            lines.append(f"Prizes entered: ${pool:,.0f} in total, ${pool / hours:,.0f} for each hour spent")
+            lines.append("                (wins are rare, so this moves more steadily than the return above)")
+    lines += type_report(conn)
     return "\n".join(lines)
+
+
+def prize_pool(conn) -> float:
+    """Total prize value of the comps you entered, from the dollar amounts in their titles."""
+    return sum(prize_hint(r["title"]) or 0 for r in conn.execute("SELECT title FROM entries WHERE action = 'entered'"))
+
+
+def by_entry_type(conn) -> list[dict]:
+    """Entries, time and wins for each OzBargain entry tag (Email Subscription, Social Media, Skill and so on).
+
+    A comp has several tags, so it counts under each of them."""
+    rows = conn.execute(
+        "SELECT e.action, e.seconds, e.won, e.prize_value, c.categories FROM entries e "
+        "JOIN comps c ON c.node_id = e.node_id WHERE e.action IN ('entered', 'skipped')"
+    ).fetchall()
+    out = {}
+    for r in rows:
+        for tag in {t.strip() for t in (r["categories"] or "").split(",") if t.strip()}:
+            t = out.setdefault(tag, {"tag": tag, "entered": 0, "skipped": 0, "seconds": 0, "timed": 0, "wins": 0, "won": 0.0})
+            t[r["action"]] += 1
+            if r["action"] == "entered" and r["seconds"] is not None:
+                t["seconds"] += r["seconds"]
+                t["timed"] += 1
+            if r["won"]:
+                t["wins"] += 1
+                t["won"] += r["prize_value"] or 0
+    return sorted(out.values(), key=lambda t: -t["entered"])
+
+
+def type_report(conn, limit: int = 10) -> list[str]:
+    types = [t for t in by_entry_type(conn) if t["entered"]][:limit]
+    if not types:
+        return []
+    width = max(len(t["tag"]) for t in types)
+    lines = ["", "By entry type (a comp can have several):"]
+    for t in types:
+        avg = _duration(t["seconds"] / t["timed"]) if t["timed"] else "?"
+        line = f"  {t['tag']:<{width}}  {t['entered']:>3} entered, about {avg} each"
+        if t["skipped"]:
+            line += f", {t['skipped']} skipped"
+        if t["wins"]:
+            line += f", {t['wins']} win{'s' if t['wins'] != 1 else ''} (${t['won']:,.0f})"
+        lines.append(line)
+    return lines
 
 
 def find_entered(conn, text: str) -> list:

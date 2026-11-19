@@ -4,7 +4,7 @@ import os
 import subprocess
 import time
 import webbrowser
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
@@ -32,17 +32,41 @@ def _entered_before_today(row, today) -> bool:
         return True
 
 
-def pending(conn, skip_gleam: bool = True) -> list:
-    """New comps, plus daily-entry comps you entered on an earlier day, soonest closing first.
+CLOSING_SOON_DAYS = 2
 
-    With skip_gleam, Gleam comps already waiting (seen before Gleam was filtered) are left out too."""
+
+def queue_order(row, today=None):
+    """Comps closing in the next couple of days first, then the biggest prizes, then the rest by closing date."""
+    today = today or date.today()
+    closes = _closing_date(row["closing"])
+    soon = closes is not None and (closes - today).days <= CLOSING_SOON_DAYS
+    value = stats.prize_hint(row["title"]) or 0
+    return (0 if soon else 1, row["closing"] or "9999" if soon else "", -value, row["closing"] or "9999")
+
+
+def pending(conn, skip_gleam: bool = True) -> list:
+    """New comps, plus daily-entry comps you entered on an earlier day.
+
+    Comps closing within two days come first, then the rest from the biggest prize down, so a short session
+    covers the best ones. With skip_gleam, Gleam comps already waiting (seen before Gleam was filtered) are left out."""
     today = date.today()
     rows = conn.execute("SELECT * FROM comps WHERE status = 'new' OR (status = 'entered' AND daily = 1)").fetchall()
     rows = [r for r in rows if r["status"] == "new" or _entered_before_today(r, today)]
     open_rows = [r for r in rows if not (_closing_date(r["closing"]) and _closing_date(r["closing"]) < today)]
     if skip_gleam:
         open_rows = [r for r in open_rows if not is_gleam(r)]
-    return sorted(open_rows, key=lambda r: r["closing"] or "9999")
+    return sorted(open_rows, key=lambda r: queue_order(r, today))
+
+
+def describe(comp) -> str:
+    """The lines shown for each comp in Enter comps."""
+    value = stats.prize_hint(comp["title"])
+    lines = [f"  Prize: about ${value:,.0f}   " if value else "  ",
+             f"Entry: {comp['categories'] or 'unknown'}   Closes: {(comp['closing'] or 'unknown')[:10]}"]
+    out = "".join(lines)
+    if comp["status"] == "entered":
+        out += "\n  Daily entry: you entered this on an earlier day, so it's back for today's entry."
+    return out + f"\n  OzBargain: {comp['node_url']}"
 
 
 def prefill_all_frames(page, me: dict) -> list[str]:
@@ -220,7 +244,7 @@ def run_normal(cfg, conn, todo) -> None:
         print("First time: a page opened in your browser. Drag its \"Fill my details\" button onto your\n"
               "bookmarks bar, then come back here and press Enter.")
         input()
-    print(f"{len(todo)} comp(s) to go, soonest closing first.\n"
+    print(f"{len(todo)} comp(s) to go: closing soon first, then biggest prizes.\n"
           "Each one opens in your browser. Click \"Fill my details\" on the entry form, check it, do any\n"
           "CAPTCHA or written answer, tick the boxes you agree to, then submit it yourself.")
     prompt = ("\n  [e] I entered it   [s] skip for good   [l] later   [o] open it again   [q] quit\n"
@@ -229,10 +253,7 @@ def run_normal(cfg, conn, todo) -> None:
               "\n  [e] I entered it   [s] skip for good   [l] later   [o] open it again   [q] quit\n  > ")
     for i, comp in enumerate(todo, 1):
         print(f"\n[{i}/{len(todo)}] {comp['title']}")
-        print(f"  Entry: {comp['categories'] or 'unknown'}   Closes: {comp['closing'] or 'unknown'}")
-        if comp["status"] == "entered":
-            print("  Daily entry: you entered this on an earlier day, so it's back for today's entry.")
-        print(f"  OzBargain: {comp['node_url']}")
+        print(describe(comp))
         started = time.monotonic()
         open_url(cfg, comp["go_url"])
         while True:
@@ -270,7 +291,37 @@ def launch(pw, channel: str):
     raise SystemExit(f"Couldn't start a browser: {last}")
 
 
+TASK_NAME = "Competition bot"
+
+
+def _ago(iso):
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(iso)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
+def background_status(conn) -> str:
+    """One line on the background task: when it last checked OzBargain, or a warning if it isn't running."""
+    beat = _ago(db.get_state(conn, "heartbeat"))
+    feed_ok = _ago(db.get_state(conn, "last_feed_ok"))
+    if beat is None or beat > 15 * 60:
+        started = False
+        if os.name == "nt":
+            started = subprocess.run(["schtasks", "/Run", "/TN", TASK_NAME], capture_output=True).returncode == 0
+        return ("Heads up: the background task wasn't running, so new comps and win emails weren't being checked. "
+                + ("It's started again now." if started else
+                   "Run setup.bat to start it again (or restart your PC)."))
+    if feed_ok is None:
+        return "The background task is running."
+    mins = int(feed_ok // 60)
+    when = "just now" if mins < 1 else f"{mins} min ago" if mins < 120 else f"{mins // 60} hours ago"
+    warn = "  (that's a while: see data\\compbot.log)" if mins >= 120 else ""
+    return f"OzBargain last checked {when}.{warn}"
+
+
 def run(cfg, conn) -> None:
+    print(background_status(conn))
     todo = pending(conn, cfg.exclude_gleam)
     if not todo:
         print("No comps waiting. You're all caught up.")
@@ -279,7 +330,7 @@ def run(cfg, conn) -> None:
         run_normal(cfg, conn, todo)
         return
     session_start = db.now()
-    print(f"{len(todo)} comp(s) to go, soonest closing first.\n"
+    print(f"{len(todo)} comp(s) to go: closing soon first, then biggest prizes.\n"
           "The browser fills in your details. Check them, do any CAPTCHA or written answer, "
           "tick the boxes you agree to, then press the site's submit button yourself.")
 
@@ -290,10 +341,7 @@ def run(cfg, conn) -> None:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         for i, comp in enumerate(todo, 1):
             print(f"\n[{i}/{len(todo)}] {comp['title']}")
-            print(f"  Entry: {comp['categories'] or 'unknown'}   Closes: {comp['closing'] or 'unknown'}")
-            if comp["status"] == "entered":
-                print("  Daily entry: you entered this on an earlier day, so it's back for today's entry.")
-            print(f"  OzBargain: {comp['node_url']}")
+            print(describe(comp))
             started = time.monotonic()
             if uses_gleam(comp):
                 open_url(cfg, comp["go_url"])
