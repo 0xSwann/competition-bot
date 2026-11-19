@@ -1,0 +1,57 @@
+name: Competition bot
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # check OzBargain and Gmail
+    - cron: "0 3 1 * *"      # monthly keepalive so GitHub doesn't pause the schedule
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: github.event.schedule != '0 3 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: compbot
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet requests
+      - name: Restore saved state
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: compbot-state-${{ github.run_id }}
+          restore-keys: compbot-state-
+      - name: Check OzBargain and Gmail
+        run: python -m compbot once
+        env:
+          COMPBOT_DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          COMPBOT_GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          COMPBOT_GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: compbot-state-${{ github.run_id }}
+
+  keepalive:
+    if: github.event.schedule == '0 3 1 * *'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          date -u +%F > .keepalive
+          git config user.name "github-actions[bot]"
+          git config user.email "41898599+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          git commit -m "Keep scheduled runs active"
+          git push

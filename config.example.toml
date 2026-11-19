@@ -1,0 +1,58 @@
+# Copy this file to config.toml and fill it in. config.toml stays on your PC only.
+
+[discord]
+# Discord channel > Edit Channel > Integrations > Webhooks > New Webhook > Copy Webhook URL
+webhook_url = ""
+
+[gmail]
+address = ""         # the Gmail account to watch
+# Google Account > Security > 2-Step Verification (must be on) > App passwords.
+# Create one called "compbot" and paste the 16 characters here.
+app_password = ""
+# Or, if app passwords aren't available: set up the Google script (phone/Code.gs with PC_MODE = true),
+# run showLink in it, and paste the line it prints here. Leave app_password blank in that case.
+relay_url = ""
+
+[me]
+# Used to pre-fill entry forms. Leave anything blank that you don't want filled.
+first_name = ""
+last_name = ""
+email = ""
+phone = ""
+address = ""
+suburb = ""
+state = ""           # e.g. NSW, VIC, QLD. Comps limited to other states are hidden.
+postcode = ""
+date_of_birth = ""   # YYYY-MM-DD
+gender = ""
+country = "Australia"
+
+[feed]
+check_every_minutes = 20
+# Comps with any of these OzBargain tags are never shown to you.
+exclude_categories = ["Purchase Required", "Recruit/Referral"]
+# Comps whose title or description contains any of these are never shown to you.
+exclude_keywords = ["new zealand only", "nz only", "nz residents only", "usa only", "us residents only", "uk only"]
+# Hide comps run on Gleam (OzBargain's "Gleam" tag, or gleam.io / gle.am links). Set to false to see them again.
+exclude_gleam = true
+
+[inbox]
+# Win-like emails from a brand or site you've entered a comp with (pressed "e" in Enter comps) always ping you.
+# For other senders: "quiet" posts them without a notification (spam-folder ones are dropped),
+# "ignore" drops them, "alert" pings you like a real win.
+unknown_senders = "quiet"
+check_every_minutes = 10
+# How far back to look the very first time it runs.
+first_run_lookback_days = 14
+
+[browser]
+# "normal": Enter comps opens each comp in your own browser, and the "Fill my details" bookmark fills the form.
+# "edge": Enter comps opens a separate Edge window that fills forms itself (Gleam comps still use your browser).
+mode = "normal"
+# In "normal" mode, open comps in this Chrome profile (the name shown in Chrome's profile menu).
+# Leave blank to use your default browser.
+chrome_profile = ""
+# Close the comp's Chrome tab when you press e or s in Enter comps.
+close_tabs = true
+# "msedge" (built into Windows 11), "chrome", or "" to try Edge, then Chrome, then Playwright's Chromium.
+channel = "msedge"
