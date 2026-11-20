@@ -450,10 +450,108 @@ def test_daily_column_migration(tmp_path):
     old.execute("CREATE TABLE comps (node_id TEXT PRIMARY KEY, title TEXT NOT NULL, node_url TEXT NOT NULL, "
                 "go_url TEXT, categories TEXT, closing TEXT, first_seen TEXT NOT NULL, status TEXT NOT NULL "
                 "DEFAULT 'new', entered_at TEXT, entry_domain TEXT)")
-    old.execute("INSERT INTO comps VALUES ('5', 'Win daily prizes', 'u', NULL, 'Website', '', 'x', 'new', NULL, NULL)")
+    old.execute("INSERT INTO comps VALUES ('5', 'Win a TV', 'u', NULL, 'Website, Daily Entry', '', 'x', 'new', NULL, NULL)")
+    old.execute("INSERT INTO comps VALUES ('6', 'Win daily prizes', 'u', NULL, 'Website', '', 'x', 'new', NULL, NULL)")
     old.commit(); old.close()
     conn = db.connect(path)
-    assert conn.execute("SELECT daily FROM comps WHERE node_id = '5'").fetchone()[0] == 1
+    daily = dict(conn.execute("SELECT node_id, daily FROM comps").fetchall())
+    assert daily == {"5": 1, "6": 0}  # "daily prizes" isn't daily entry
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("You can enter daily", True),
+    ("One entry per person per day", True),
+    ("Entry frequency: Daily", True),
+    ("Enter once a day until 1 Dec", True),
+    ("Daily prizes to be won! Lucky draw", False),
+    ("Winners drawn daily", False),
+    ("Check out our daily deals. One entry per person", False),
+    ("Instant win: prizes released every day", False),
+])
+def test_daily_wording(text, expected):
+    assert feed.is_daily({"categories": "Website", "title": "Win", "text": text}) is expected
+
+
+def test_wrongly_daily_comps_stop_coming_back(tmp_path):
+    """Comps flagged daily by the old, loose check (e.g. "daily prizes" in the description) are reset."""
+    from compbot import entry
+    conn = db.connect(tmp_path / "t.db")
+    conn.execute("INSERT INTO comps (node_id, title, node_url, first_seen, status, entered_at, daily, closing, categories) "
+                 "VALUES ('1', 'Win 1 of 12 $1,000 Emporium Melbourne Gift Cards [VIC]', 'u', 'x', 'entered', "
+                 "'2020-01-01T00:00:00+00:00', 1, '2099-01-01', 'Lucky Draw, Website, VIC')")
+    conn.commit()
+    db.set_state(conn, "daily_v2", "")  # pretend the reset ran already, then undo it
+    conn.execute("DELETE FROM state WHERE key = 'daily_v2'")
+    conn.commit()
+    conn.close()
+    conn = db.connect(tmp_path / "t.db")
+    assert entry.pending(conn) == []
+
+
+def test_skipping_a_returning_daily_comp_keeps_it_entered(tmp_path):
+    from compbot import entry
+    conn = db.connect(tmp_path / "t.db")
+    conn.execute("INSERT INTO comps (node_id, title, node_url, first_seen, status, entered_at, daily, closing) "
+                 "VALUES ('1', 'Win a TV (Daily Entry)', 'u', 'x', 'entered', '2020-01-01T00:00:00+00:00', 1, '2099-01-01')")
+    conn.commit()
+    [row] = entry.pending(conn)
+    entry._record(conn, row, "s")
+    assert tuple(conn.execute("SELECT status, daily FROM comps").fetchone()) == ("entered", 0)
+    assert entry.pending(conn) == []
+
+
+@pytest.mark.parametrize("a,b,expected", [
+    ("Win a 2027 Melbourne F1 Race Weekend from Chivas", "Win a 2027 Melbourne F1 Race Weekend from Chivas [VIC]", True),
+    ("Win 1 of 12 $1,000 Emporium Melbourne Gift Cards", "Win 1 of 12 $1000 Emporium Melbourne Gift Cards from Emporium", True),
+    ("Win a $500 Myer Gift Card", "Win a $1,000 Myer Gift Card", False),
+    ("Win a TV from Sony", "Win a Trip to Japan from JAL", False),
+])
+def test_same_comp(a, b, expected):
+    assert feed.same_comp(a, b) is expected
+
+
+REPOST = FEED.replace("979426", "989426").replace("Win a 6-Night Trip to Whistler", "Win a 6-Night Trip to Whistler [NSW, VIC]")
+
+
+def test_reposted_comps_hidden(tmp_path, monkeypatch):
+    from compbot import entry
+    posts = []
+    monkeypatch.setattr(feed.discord, "post", lambda *a, **k: posts.append(a))
+    conn = db.connect(tmp_path / "t.db")
+    feed.check(cfg(), conn, FEED)
+    conn.execute("UPDATE comps SET status = 'entered', entered_at = ? WHERE node_id = '979426'", (db.now(),))
+    conn.commit()
+    assert feed.check(cfg(), conn, REPOST) == []  # posted again with a new id: not shown, not posted
+    assert conn.execute("SELECT status FROM comps WHERE node_id = '989426'").fetchone()[0] == "repeat"
+
+    # Entered long ago, or the window turned off: the re-post shows up.
+    c = cfg()
+    c.repeat_days = 0
+    conn2 = db.connect(tmp_path / "t2.db")
+    feed.check(c, conn2, FEED)
+    conn2.execute("UPDATE comps SET status = 'entered', entered_at = ? WHERE node_id = '979426'", (db.now(),))
+    assert [x["node_id"] for x in feed.check(c, conn2, REPOST)] == ["989426"]
+    conn2.execute("UPDATE comps SET entered_at = '2020-01-01T00:00:00+00:00' WHERE node_id = '979426'")
+    conn2.execute("UPDATE comps SET status = 'new' WHERE node_id = '989426'")
+    assert [r["node_id"] for r in entry.pending(conn2, cfg())] == ["989426"]
+
+    # A re-post already waiting in Enter comps is dropped from it too.
+    conn2.execute("UPDATE comps SET entered_at = ? WHERE node_id = '979426'", (db.now(),))
+    assert entry.pending(conn2, cfg()) == []
+    assert conn2.execute("SELECT status FROM comps WHERE node_id = '989426'").fetchone()[0] == "repeat"
+
+
+def test_helper_warns_about_same_website():
+    from compbot import helper
+    todo = [{"node_id": "2", "title": "Win $5", "go_url": "u", "categories": "", "closing": "", "status": "new"}]
+    s = helper.Session(todo, {})
+    s.note_entered({"node_id": "1", "title": "Win a Holiday", "entered_at": "2026-11-16T08:22:27+00:00"},
+                   ["www.bne.com.au", "app.viralsweep.com"])
+    assert s.current("bne.com.au")["sameSite"] == {"title": "Win a Holiday", "on": "2026-11-16"}
+    assert s.current("app.viralsweep.com")["sameSite"] is None  # an embedded form platform, not the website
+    assert s.current("")["sameSite"] is None
+    s.note_entered({"node_id": "2", "title": "Win $5", "entered_at": "x"}, ["shop.example"])
+    assert s.current("shop.example")["sameSite"] is None  # the comp itself
 
 
 POPUP = """<!doctype html><html><body>
@@ -806,6 +904,9 @@ def test_extension_end_to_end(tmp_path, monkeypatch):
             page.get_by_role("button", name="Entered").click()
             page.locator("text=Comp 2 of 3").wait_for(timeout=10000)
             assert page.url.endswith("/goto/2/")
+            # Comp 2 is on the same website as comp 1, which you just entered: the bar says so.
+            page.locator("text=You entered a comp on this website").wait_for(timeout=5000)
+            assert page.locator("text=Win a $900 Bike from Acme").count() == 1
             os.write(w_fd, b"s\n")  # pressed in the terminal instead: the tab catches up by itself
             page.locator("text=This comp's page didn't load").wait_for(timeout=15000)  # comp 3's site is down
             page.locator("text=Comp 3 of 3: Win a Cap").wait_for(timeout=10000)

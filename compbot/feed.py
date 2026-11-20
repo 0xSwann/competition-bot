@@ -1,7 +1,7 @@
 """Polls the OzBargain competitions RSS feed and records new comps."""
 import re
 import xml.etree.ElementTree as ET
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 
@@ -83,12 +83,64 @@ def restricted_states(text: str) -> set[str]:
     return found
 
 
-_DAILY = re.compile(r"\bdaily\b|\b(?:every|each|per|once a|one entry a) day\b|\benter (?:again )?(?:every|each) day\b", re.I)
+# Only wording about how often you can *enter* counts. "Daily prizes", "drawn daily" or "daily deals" don't
+# mean you can enter again tomorrow: comps like that came back every day and their sites said "already entered".
+_DAILY = re.compile(
+    r"\b(?:enter|entry|play)\s+(?:once\s+)?(?:again\s+)?(?:daily|every\s+day|each\s+day)\b"
+    r"|\bdaily\s+entr(?:y|ies)\b"
+    r"|\bentry\s+frequency\W{0,3}daily\b"
+    r"|\b(?:one|1)\s+entry\s+(?:per\s+person\s+)?(?:per|a|each)\s+day\b"
+    r"|\b(?:enter|entry)\b[^.]{0,30}\bonce\s+(?:a|per|each)\s+day\b"
+    r"|\bevery\s+day\s+(?:to|you\s+can)\s+enter\b",
+    re.I,
+)
 
 
-def is_daily(comp: dict) -> bool:
-    """True if the comp lets you enter once a day."""
-    return bool(_DAILY.search(" ".join([comp.get("categories", ""), comp.get("title", ""), comp.get("text", "")])))
+def is_daily(comp) -> bool:
+    """True if the comp says you can enter once a day (e.g. "enter daily", "one entry per day")."""
+    get = comp.get if isinstance(comp, dict) else (lambda k, d="": comp[k] if k in comp.keys() else d)
+    return bool(_DAILY.search(" ".join(str(get(k, "") or "") for k in ("categories", "title", "text"))))
+
+
+def _title_words(title: str) -> str:
+    t = re.sub(r"(?<=\d),(?=\d{3})", "", (title or "").lower())  # $1,000 -> $1000
+    t = re.sub(r"\[[^\]]*\]", " ", t)  # [VIC], [Members App]
+    return " ".join(re.findall(r"[a-z0-9]+", t))
+
+
+def same_comp(a: str, b: str) -> bool:
+    """True when two OzBargain titles look like the same comp posted twice: nearly the same words and the
+    same numbers (so "$500 gift card" and "$1,000 gift card" from one shop stay separate)."""
+    from difflib import SequenceMatcher
+    wa, wb = _title_words(a), _title_words(b)
+    if not wa or not wb:
+        return False
+    if sorted(re.findall(r"\d+", wa)) != sorted(re.findall(r"\d+", wb)):
+        return False
+    if wa == wb or SequenceMatcher(None, wa, wb).ratio() >= 0.88:
+        return True
+    # One title is the other plus a few words, e.g. "... from Emporium Melbourne" added on the re-post.
+    sa, sb = set(wa.split()), set(wb.split())
+    small = min(sa, sb, key=len)
+    return len(small) >= 5 and len(sa & sb) / len(small) >= 0.9
+
+
+def recently_entered(conn, days: int) -> list:
+    """Comps you marked entered in the last `days` days (newest first)."""
+    if not days or days <= 0:
+        return []
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    return conn.execute(
+        "SELECT * FROM comps WHERE status = 'entered' AND entered_at >= ? ORDER BY entered_at DESC", (cutoff,)
+    ).fetchall()
+
+
+def repeat_of(comp, entered_rows):
+    """The comp you already entered that this one is a re-post of, or None."""
+    for r in entered_rows:
+        if r["node_id"] != comp["node_id"] and same_comp(comp["title"], r["title"]):
+            return r
+    return None
 
 
 _GLEAM_DOMAIN = re.compile(r"(?:^|[/.\s(\"'])(?:gleam\.io|gle\.am)\b", re.I)
@@ -153,16 +205,20 @@ def check(cfg, conn, xml_text: str | None = None) -> list[dict]:
     """Fetch the feed, store unseen comps and alert Discord. Returns the new wanted comps."""
     comps = parse(xml_text if xml_text is not None else fetch(cfg.feed_url))
     first_run = db.get_state(conn, "feed_initialised") is None
+    entered = recently_entered(conn, getattr(cfg, "repeat_days", 30))
     new_wanted = []
     for c in comps:
         if conn.execute("SELECT 1 FROM comps WHERE node_id = ?", (c["node_id"],)).fetchone():
             continue
         wanted = is_wanted(c, cfg)
+        status = "new" if wanted else "filtered"
+        if wanted and repeat_of(c, entered):
+            wanted, status = False, "repeat"  # posted again on OzBargain, but you've already entered it
         conn.execute(
             "INSERT INTO comps (node_id, title, node_url, go_url, categories, closing, first_seen, status, daily) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (c["node_id"], c["title"], c["node_url"], c["go_url"], c["categories"],
-             c["closing"], db.now(), "new" if wanted else "filtered", int(is_daily(c))),
+             c["closing"], db.now(), status, int(is_daily(c))),
         )
         if wanted:
             new_wanted.append(c)

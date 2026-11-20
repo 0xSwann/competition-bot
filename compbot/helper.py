@@ -27,6 +27,17 @@ class Session:
         self.extension_seen = 0.0
         self.finished = False
         self.summary = ""
+        self.entered_sites = {}  # website -> (node id, title, entered at) of a comp you entered there lately
+
+    @staticmethod
+    def site(host: str) -> str:
+        return (host or "").lower().removeprefix("www.")
+
+    def note_entered(self, comp, hosts) -> None:
+        """Remembers the website a comp was entered on (the page itself, not forms embedded in it)."""
+        if hosts:
+            with self.lock:
+                self.entered_sites.setdefault(self.site(hosts[0]), (comp["node_id"], comp["title"], comp["entered_at"] or ""))
 
     @property
     def comp(self):
@@ -35,12 +46,14 @@ class Session:
     def extension_active(self, within: float = 15) -> bool:
         return time.time() - self.extension_seen < within
 
-    def current(self) -> dict:
+    def current(self, host: str = "") -> dict:
         with self.lock:
             c = self.comp
             if c is None:
                 return {"done": True, "summary": self.summary, "me": self.me}
+            same = self.entered_sites.get(self.site(host)) if host else None
             return {
+                "sameSite": {"title": same[1], "on": same[2][:10]} if same and same[0] != c["node_id"] else None,
                 "done": False, "id": c["node_id"], "title": c["title"], "goUrl": c["go_url"],
                 "prize": stats.prize_hint(c["title"]), "entry": c["categories"] or "",
                 "closes": (c["closing"] or "")[:10], "daily": c["status"] == "entered",
@@ -118,7 +131,9 @@ class Handler(BaseHTTPRequestHandler):
             if not self._from_extension():
                 return self._send(403, '{"error": "forbidden"}')
             s.extension_seen = time.time()
-            self._send(200, json.dumps(s.current()))
+            from urllib.parse import parse_qs, urlsplit
+            host = (parse_qs(urlsplit(self.path).query).get("host") or [""])[0][:100]
+            self._send(200, json.dumps(s.current(host)))
         else:
             self._send(404, '{"error": "not found"}')
 

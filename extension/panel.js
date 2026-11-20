@@ -36,6 +36,8 @@
         .fill { background: #1f7a4d; border-color: #1f7a4d; color: #fff; width: 100%; margin-bottom: 6px; }
         .entered { background: #e7f4ec; border-color: #9fd0b2; }
         .tip { color: #777; font-size: 11px; margin-top: 6px; }
+        .warn { background: #fff4d6; border: 1px solid #e9c46a; border-radius: 7px; padding: 6px 8px; margin: 0 0 8px;
+                color: #5c4200; font-size: 12px; }
         .min { background: none; border: 0; flex: none; padding: 0 2px; color: #777; font-size: 15px; line-height: 1; }
         .pill { font: 600 12px system-ui, sans-serif; background: #1f7a4d; color: #fff; border: 0; border-radius: 16px;
                 padding: 7px 12px; flex: none; }
@@ -44,6 +46,10 @@
       <div class="bar">
         <div class="top"><span>${info.map(esc).join(' · ')}</span><button class="min" data-k="collapse" title="Make smaller">–</button></div>
         <div class="title" title="${esc(cur.title)}">${esc(cur.title)}</div>
+        ${cur.sameSite ? `<div class="warn">You entered a comp on this website on ${esc(cur.sameSite.on)}:
+          <b>${esc(cur.sameSite.title)}</b>. If it's the same comp, press Skip.</div>` : ''}
+        ${cur.daily ? `<div class="warn">Back for today's daily entry. If the site says you've already entered,
+          press Skip and it won't come back.</div>` : ''}
         <button class="fill" data-k="fill">Fill my details</button>
         <div class="row">
           <button class="entered" data-k="e" title="I submitted it. Go to the next comp.">Entered</button>

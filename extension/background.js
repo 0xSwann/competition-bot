@@ -122,7 +122,9 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     if (msg.type === 'status') {
       if (!isComp) return reply({ show: false });
       let cur;
-      try { cur = await api('/api/current'); } catch (e) {
+      let host = '';
+      try { host = new URL(sender.tab.url).hostname; } catch (e) { /* not a web page */ }
+      try { cur = await api('/api/current?host=' + encodeURIComponent(host)); } catch (e) {
         await chrome.storage.session.remove(['tabId', 'shownId']); // Enter comps was closed
         return reply({ show: false });
       }

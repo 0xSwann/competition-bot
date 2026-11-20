@@ -37,6 +37,10 @@ exclude_gleam = true
 # Hide comps entered on Instagram (OzBargain's "Instagram" tag, instagram.com links, or Instagram in the
 # title or description). Set to false to see them again.
 exclude_instagram = true
+# A comp you marked entered in the last this-many days is never shown again: re-posts of it on OzBargain are
+# hidden, and Enter comps warns you if a comp opens on a website you entered a comp on. 0 turns this off.
+# (Comps that say you can enter daily still come back each day.)
+repeat_days = 30
 
 [inbox]
 # Win-like emails from a brand or site you've entered a comp with (pressed "e" in Enter comps) always ping you.
