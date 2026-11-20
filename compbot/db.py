@@ -73,6 +73,15 @@ def connect(path=None) -> sqlite3.Connection:
     if "daily" not in {r[1] for r in conn.execute("PRAGMA table_info(comps)")}:
         conn.execute("ALTER TABLE comps ADD COLUMN daily INTEGER NOT NULL DEFAULT 0")
         conn.execute("UPDATE comps SET daily = 1 WHERE lower(categories || ' ' || title) LIKE '%daily%'")
+        conn.commit()
+    if get_state(conn, "daily_v2") is None:
+        # Older versions called a comp "daily" if "daily" appeared anywhere in its description ("daily prizes",
+        # "drawn daily"), so one-off comps came back every day. Keep only those whose tags or title say so.
+        from .feed import is_daily
+        for r in conn.execute("SELECT node_id, categories, title FROM comps WHERE daily = 1").fetchall():
+            if not is_daily({"categories": r["categories"] or "", "title": r["title"]}):
+                conn.execute("UPDATE comps SET daily = 0 WHERE node_id = ?", (r["node_id"],))
+        set_state(conn, "daily_v2", now())
     # Older versions linked to the OzBargain page instead of the comp's "Go to" link.
     conn.execute(
         "UPDATE comps SET go_url = 'https://www.ozbargain.com.au/goto/' || node_id "

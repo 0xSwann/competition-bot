@@ -25,6 +25,7 @@ class Config:
     exclude_keywords: list = field(default_factory=list)
     exclude_gleam: bool = True
     exclude_instagram: bool = True
+    repeat_days: int = 30
     win_keywords: list = field(default_factory=list)
     browser_channel: str = ""
     browser_mode: str = "normal"
@@ -73,6 +74,7 @@ def load(path: Path = CONFIG_PATH) -> Config:
         exclude_keywords=[k.lower() for k in feed.get("exclude_keywords", [])],
         exclude_gleam=bool(feed.get("exclude_gleam", True)),
         exclude_instagram=bool(feed.get("exclude_instagram", True)),
+        repeat_days=int(feed.get("repeat_days", 30)),
         win_keywords=[k.lower() for k in inbox.get("win_keywords", DEFAULT_WIN_KEYWORDS)],
         browser_channel=browser.get("channel", ""),
         browser_mode=str(browser.get("mode", "normal")).lower(),

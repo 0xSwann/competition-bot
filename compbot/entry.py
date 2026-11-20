@@ -12,7 +12,7 @@ from urllib.parse import quote, urlparse
 
 from . import db, stats
 from .config import DATA_DIR
-from .feed import _closing_date, is_gleam, is_hidden_platform
+from .feed import _closing_date, is_gleam, is_hidden_platform, recently_entered, repeat_of
 
 PREFILL_JS = (Path(__file__).parent / "prefill.js").read_text(encoding="utf-8")
 
@@ -51,12 +51,19 @@ def pending(conn, cfg=None) -> list:
 
     Comps closing within two days come first, then the rest from the biggest prize down, so a short session
     covers the best ones. Gleam and Instagram comps already waiting (seen before they were filtered) are left out too,
-    unless config.toml shows them."""
+    unless config.toml shows them, and so are re-posts of comps you entered in the last [feed] repeat_days days."""
     today = date.today()
     rows = conn.execute("SELECT * FROM comps WHERE status = 'new' OR (status = 'entered' AND daily = 1)").fetchall()
     rows = [r for r in rows if r["status"] == "new" or _entered_before_today(r, today)]
     open_rows = [r for r in rows if not (_closing_date(r["closing"]) and _closing_date(r["closing"]) < today)]
     open_rows = [r for r in open_rows if not is_hidden_platform(r, cfg)]
+    entered = recently_entered(conn, getattr(cfg, "repeat_days", 30))
+    repeats = [r for r in open_rows if r["status"] == "new" and repeat_of(r, entered)]
+    for r in repeats:
+        conn.execute("UPDATE comps SET status = 'repeat' WHERE node_id = ?", (r["node_id"],))
+    if repeats:
+        conn.commit()
+    open_rows = [r for r in open_rows if r not in repeats]
     return sorted(open_rows, key=lambda r: queue_order(r, today))
 
 
@@ -67,7 +74,8 @@ def describe(comp) -> str:
              f"Entry: {comp['categories'] or 'unknown'}   Closes: {(comp['closing'] or 'unknown')[:10]}"]
     out = "".join(lines)
     if comp["status"] == "entered":
-        out += "\n  Daily entry: you entered this on an earlier day, so it's back for today's entry."
+        out += ("\n  Daily entry: you entered this on an earlier day, so it's back for today's entry."
+                "\n  If the site says you've already entered, press s and it won't come back.")
     return out + f"\n  OzBargain: {comp['node_url']}"
 
 
@@ -234,6 +242,9 @@ def _record(conn, comp, choice, host="", started=None):
             "UPDATE comps SET status = 'entered', entered_at = ?, entry_domain = ? WHERE node_id = ?",
             (db.now(), host, comp["node_id"]),
         )
+    elif choice == "s" and "status" in comp.keys() and comp["status"] == "entered":
+        # A daily comp you've already entered: skipping it means it isn't really daily, so stop bringing it back.
+        conn.execute("UPDATE comps SET daily = 0 WHERE node_id = ?", (comp["node_id"],))
     elif choice == "s":
         conn.execute("UPDATE comps SET status = 'skipped' WHERE node_id = ?", (comp["node_id"],))
     conn.commit()
@@ -273,6 +284,8 @@ def run_normal(cfg, conn, todo, keys=None) -> None:
     sync_extension()
 
     session = helper.Session(todo, cfg.me)
+    for r in recently_entered(conn, getattr(cfg, "repeat_days", 30)):
+        session.note_entered(r, (r["entry_domain"] or "").split())
     if helper.start(session) is None:
         print("Enter comps already seems to be open in another window. Use that one, or close it and try again.")
         return
@@ -320,6 +333,8 @@ def run_normal(cfg, conn, todo, keys=None) -> None:
             if source == "terminal":
                 print(prompt, end="", flush=True)
         _record(conn, comp, choice, host=" ".join(hosts), started=started)
+        if choice == "e":
+            session.note_entered({**dict(comp), "entered_at": db.now()}, hosts)
         from_terminal_at = time.time() if source == "terminal" else 0.0
         if source == "extension":
             print({"e": "entered", "s": "skipped", "l": "later", "q": "quit"}[choice] + " (from Chrome)")

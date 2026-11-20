@@ -55,6 +55,8 @@ When the Google script changes: paste the new `phone/Code.gs` into script.google
 
 - `exclude_categories`: OzBargain tags to hide. The default hides *Purchase Required* and *Recruit/Referral*. Add `"Like/Follow/Comment/Share"` to hide those too.
 - `exclude_gleam`: hides comps run on Gleam (tagged *Gleam* on OzBargain, or linking to gleam.io / gle.am). On by default; set it to `false` to see them again.
+- `repeat_days` (default 30): once you mark a comp entered, it won't be shown again for this many days, even if OzBargain posts it again under a new title or link (titles that are nearly the same with the same prize amounts count as the same comp). If a comp opens on a website you entered a comp on in that time, the extension's bar tells you which one, so you can press Skip if it's the same. `0` turns this off.
+- Daily-entry comps (the comp says you can enter daily or once per day) come back each day you haven't entered them yet. If one comes back and the site says you've already entered, press Skip: it stays counted as entered and won't come back again.
 - `exclude_instagram`: hides comps entered on Instagram (tagged *Instagram* on OzBargain, linking to instagram.com, or mentioning Instagram in the title or description). On by default; set it to `false` to see them again.
 - `exclude_keywords`: hides comps whose title or description contains these words (default: NZ-, US- and UK-only).
 - `state` under `[me]`: comps limited to other states are hidden.
